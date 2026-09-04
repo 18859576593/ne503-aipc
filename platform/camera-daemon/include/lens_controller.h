@@ -47,4 +47,11 @@ public:
     // keeps other builders (tests/tools) source-compatible. Called with the
     // lens mutex held: implementations must not call back into the controller.
     virtual void set_zoom_motion_observer(std::function<void(float)> /*obs*/) {}
+
+    // Position-recorder arming hook: fired on every successfully issued user
+    // motion (RPC handlers and the wait-methods above), including moves the
+    // autofocus controller makes through those methods. Never fired for
+    // init/bootstrap parking, so a restore archive cannot be clobbered by the
+    // boot park. Same contract as the observer: mutex held, no call-backs.
+    virtual void set_motion_listener(std::function<void()> /*listener*/) {}
 };

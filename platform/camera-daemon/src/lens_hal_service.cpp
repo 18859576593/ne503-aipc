@@ -93,6 +93,11 @@ public:
         zoom_motion_observer_ = std::move(obs);
     }
 
+    void set_motion_listener(std::function<void()> listener) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        motion_listener_ = std::move(listener);
+    }
+
     bool autofocus_operation_active() const override {
         return af_operation_active_.load();
     }
@@ -153,6 +158,7 @@ public:
             } else if (initialized_ && sym_.zoom_abs) {
                 ret = sym_.zoom_abs(1, pps, position);
             }
+            if (ret == HAL_OK) notify_motion_locked();
         }
         if (ret != HAL_OK) return ret;
         if (event_waited && !fg2009_) return HAL_OK;
@@ -175,6 +181,7 @@ public:
             } else if (initialized_ && sym_.focus_abs) {
                 ret = sym_.focus_abs(1, pps, position);
             }
+            if (ret == HAL_OK) notify_motion_locked();
         }
         if (ret != HAL_OK) return ret;
         if (event_waited && !fg2009_) return HAL_OK;
@@ -203,9 +210,11 @@ public:
          * Do not hold mu_ while waiting. Cancellation must be able to acquire
          * it and send stop commands while a long dual-axis segment is active.
          */
-        return sync_abs(static_cast<uint16_t>(zoom_pps), zoom_position,
-                        static_cast<uint16_t>(focus_pps), focus_position,
-                        timeout_ms);
+        const int ret = sync_abs(static_cast<uint16_t>(zoom_pps), zoom_position,
+                                 static_cast<uint16_t>(focus_pps), focus_position,
+                                 timeout_ms);
+        if (ret == HAL_OK) notify_motion();
+        return ret;
     }
 
     int stop_all(uint32_t timeout_ms) override {
@@ -213,6 +222,7 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             if (sym_.zoom_stop) sym_.zoom_stop(1);
             if (sym_.focus_stop) sym_.focus_stop(1);
+            notify_motion_locked();
         }
         const bool zoom_ok = wait_motor_stopped(true, timeout_ms);
         const bool focus_ok = wait_motor_stopped(false, timeout_ms);
@@ -509,6 +519,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_run failed");
         return grpc::Status::OK;
@@ -532,6 +543,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_abs failed");
         return grpc::Status::OK;
@@ -543,6 +555,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "zoom_stop")) return grpc::Status::OK;
         int ret = sym_.zoom_stop(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_stop failed");
         return grpc::Status::OK;
     }
@@ -558,6 +571,7 @@ public:
             return grpc::Status::OK;
         }
         int ret = sym_.zoom_rz(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_rz failed");
         return grpc::Status::OK;
     }
@@ -616,6 +630,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_run failed");
         return grpc::Status::OK;
@@ -637,6 +652,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_abs failed");
         return grpc::Status::OK;
@@ -648,6 +664,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (reject_if_af_active(resp, "focus_stop")) return grpc::Status::OK;
         int ret = sym_.focus_stop(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_stop failed");
         return grpc::Status::OK;
     }
@@ -663,6 +680,7 @@ public:
             return grpc::Status::OK;
         }
         int ret = sym_.focus_rz(1);
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_rz failed");
         return grpc::Status::OK;
     }
@@ -781,6 +799,7 @@ public:
         if (reject_if_fg2009(resp, "af0832_force_reset_zero")) return grpc::Status::OK;
         ensure_af0832_created();
         int ret = sym_.af0832_force_reset_zero ? sym_.af0832_force_reset_zero() : -1;
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "af0832_force_reset_zero failed");
         return grpc::Status::OK;
     }
@@ -795,6 +814,7 @@ public:
         int ret = sym_.af0832_goto
                   ? sym_.af0832_goto(req->zoom_ratio(), req->focus_distance_m())
                   : -1;
+        if (ret == 0) notify_motion_locked();
         fill_status(resp, ret, ret == 0 ? "ok" : "af0832_goto failed");
         return grpc::Status::OK;
     }
@@ -915,6 +935,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_goto_ratio failed");
         return grpc::Status::OK;
@@ -933,6 +954,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_goto_level failed");
         return grpc::Status::OK;
@@ -950,6 +972,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "zoom_move_rel failed");
         return grpc::Status::OK;
@@ -967,6 +990,7 @@ public:
             if (consecutive_errors_ >= 3) try_auto_reinit();
         } else {
             consecutive_errors_ = 0;
+            notify_motion_locked();
         }
         fill_status(resp, ret, ret == 0 ? "ok" : "focus_move_rel failed");
         return grpc::Status::OK;
@@ -992,6 +1016,7 @@ public:
         bool focus_ok = wait_motor_stopped(false, req->timeout_ms());
 
         bool ok = zoom_ok && focus_ok;
+        if (ok) notify_motion();
         fill_status(resp, ok ? 0 : -1, ok ? "ok" : "stop_and_wait timeout");
         return grpc::Status::OK;
     }
@@ -1022,6 +1047,7 @@ private:
     // Fired after every issued FG2009 zoom move (new optical ratio, computed
     // from the model while mu_ is held — receivers must not call back).
     std::function<void(float)> zoom_motion_observer_;
+    std::function<void()> motion_listener_;
 
     /* ── dlopen / dlsym ─────────────────────────────────────────────── */
 
@@ -1359,6 +1385,25 @@ private:
         HAL_LOG_INFO("LensHAL: zoom moved (curve %d, ratio %.3f); notifying "
                      "observer", fg2009_state_.zoom_curve, ratio);
         zoom_motion_observer_(ratio);
+    }
+
+    /* Arms the daemon's lens-position recorder after a successfully issued
+     * motion. Idempotent and cheap (the listener only sets an atomic and
+     * kicks a condvar), so firing it from every motion path costs nothing
+     * while the lens is idle. Variant for call sites already holding mu_. */
+    void notify_motion_locked() {
+        if (motion_listener_) motion_listener_();
+    }
+
+    /* Lock-free-context variant: snapshots the listener under mu_, then runs
+     * it outside the lock. */
+    void notify_motion() {
+        std::function<void()> listener;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            listener = motion_listener_;
+        }
+        if (listener) listener();
     }
 
     /* Physical relative jog, clamped so the model stays inside travel. */
