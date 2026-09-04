@@ -2917,47 +2917,6 @@ static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
 }
 
 #ifdef HAS_GRPC
-namespace {
-
-/* Minimal tolerant JSON field readers for the lens-position archive, in the
- * same style as load_profile_config's hand parse. */
-bool json_find_string(const std::string& text, const char* key, std::string* out) {
-    const std::string pat = std::string("\"") + key + "\"";
-    std::size_t i = text.find(pat);
-    if (i == std::string::npos) return false;
-    i = text.find('"', i + pat.size());
-    if (i == std::string::npos) return false;
-    const std::size_t start = ++i;
-    while (i < text.size() && text[i] != '"') {
-        if (text[i] == '\\' && i + 1 < text.size()) ++i;  // skip escaped char
-        ++i;
-    }
-    if (i >= text.size()) return false;
-    *out = text.substr(start, i - start);
-    return true;
-}
-
-bool json_find_number(const std::string& text, const char* key, double* out) {
-    const std::string pat = std::string("\"") + key + "\"";
-    std::size_t i = text.find(pat);
-    if (i == std::string::npos) return false;
-    i = text.find(':', i + pat.size());
-    if (i == std::string::npos) return false;
-    ++i;
-    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
-    const std::size_t start = i;
-    while (i < text.size() && (std::isdigit(static_cast<unsigned char>(text[i])) ||
-           text[i] == '-' || text[i] == '+' || text[i] == '.' ||
-           text[i] == 'e' || text[i] == 'E')) {
-        ++i;
-    }
-    if (i == start) return false;
-    *out = std::strtod(text.substr(start, i - start).c_str(), nullptr);
-    return true;
-}
-
-}  // namespace
-
 CameraDaemon::ArchivedLensPosition CameraDaemon::load_archived_lens_position() {
     ArchivedLensPosition pos;
     std::ifstream in(kLensPositionPath);
@@ -2967,24 +2926,18 @@ CameraDaemon::ArchivedLensPosition CameraDaemon::load_archived_lens_position() {
                      kLensPositionPath);
         return pos;
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    const std::string text = ss.str();
-
-    double v = 0.0;
-    if (!json_find_string(text, "model", &pos.model) ||
-        !json_find_number(text, "zoom_pos", &v)) {
-        HAL_LOG_WARNING("CameraDaemon: archived lens position malformed; ignoring");
+    try {
+        const nlohmann::json j = nlohmann::json::parse(in);
+        pos.model = j.at("model").get<std::string>();
+        pos.zoom_pos = j.at("zoom_pos").get<int32_t>();
+        pos.focus_pos = j.at("focus_pos").get<int32_t>();
+        if (j.contains("zoom_ratio")) pos.zoom_ratio = j["zoom_ratio"].get<float>();
+        if (j.contains("saved_at")) pos.saved_at = j["saved_at"].get<int64_t>();
+    } catch (const std::exception& e) {
+        HAL_LOG_WARNING("CameraDaemon: archived lens position malformed (%s); "
+                        "ignoring", e.what());
         return ArchivedLensPosition{};
     }
-    pos.zoom_pos = static_cast<int32_t>(v);
-    if (!json_find_number(text, "focus_pos", &v)) {
-        HAL_LOG_WARNING("CameraDaemon: archived lens position malformed; ignoring");
-        return ArchivedLensPosition{};
-    }
-    pos.focus_pos = static_cast<int32_t>(v);
-    if (json_find_number(text, "zoom_ratio", &v)) pos.zoom_ratio = static_cast<float>(v);
-    if (json_find_number(text, "saved_at", &v)) pos.saved_at = static_cast<int64_t>(v);
     if (pos.valid() && pos.model != config_.lens_model) {
         HAL_LOG_WARNING("CameraDaemon: discarding archived lens position "
                         "(saved for %s, current lens %s)",
@@ -2995,15 +2948,13 @@ CameraDaemon::ArchivedLensPosition CameraDaemon::load_archived_lens_position() {
 }
 
 bool CameraDaemon::save_archived_lens_position(const ArchivedLensPosition& pos) {
-    // The model field is a controlled token (af0832/fg2009), so no JSON
-    // escaping is needed here.
-    char content[192];
-    std::snprintf(content, sizeof(content),
-                  "{\"model\":\"%s\",\"zoom_ratio\":%.3f,\"zoom_pos\":%d,"
-                  "\"focus_pos\":%d,\"saved_at\":%lld}\n",
-                  pos.model.c_str(), static_cast<double>(pos.zoom_ratio),
-                  static_cast<int>(pos.zoom_pos), static_cast<int>(pos.focus_pos),
-                  static_cast<long long>(pos.saved_at));
+    const nlohmann::json j = {
+        {"model", pos.model},
+        {"zoom_ratio", pos.zoom_ratio},
+        {"zoom_pos", pos.zoom_pos},
+        {"focus_pos", pos.focus_pos},
+        {"saved_at", pos.saved_at},
+    };
     const std::string tmp = std::string(kLensPositionPath) + ".tmp";
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
@@ -3011,7 +2962,7 @@ bool CameraDaemon::save_archived_lens_position(const ArchivedLensPosition& pos) 
                         tmp.c_str());
         return false;
     }
-    out << content;
+    out << j.dump() << "\n";
     out.close();
     if (!out) {
         HAL_LOG_WARNING("CameraDaemon: failed to write lens position archive: %s",

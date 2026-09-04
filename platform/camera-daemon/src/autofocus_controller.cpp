@@ -932,18 +932,23 @@ private:
                          zoom_target, focus_target);
             set_state(AutofocusState::StartupAf, 0.04,
                       "restoring archived lens position");
-            const int ret = move_zoom_focus(zoom_target, focus_target,
-                                            "archived restore");
-            if (ret != HAL_OK) return ret;
-
-            *focus_center = focus_target;
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                status_.effective_ratio = lens_->pos_to_ratio(zoom_target);
-                status_.zoom_pos = zoom_target;
-                status_.focus_pos = focus_target;
+            if (move_zoom_focus(zoom_target, focus_target,
+                                "archived restore") == HAL_OK) {
+                *focus_center = focus_target;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    status_.effective_ratio = lens_->pos_to_ratio(zoom_target);
+                    status_.zoom_pos = zoom_target;
+                    status_.focus_pos = focus_target;
+                }
+                return HAL_OK;
             }
-            return HAL_OK;
+            // A malformed archive (e.g. out-of-travel zoom) fails the
+            // replay; fall through to the config-derived seed rather than
+            // killing the startup job. FG2009's restore has the equivalent
+            // fallback to its boot one-shot.
+            HAL_LOG_WARNING("Autofocus: archived lens position replay failed; "
+                            "falling back to config startup seed");
         }
 
         int32_t zoom_target = 0;
