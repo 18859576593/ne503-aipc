@@ -1018,10 +1018,39 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
         p->infer_model->set_batch_size(config->batch_size);
 
     // Enable HW latency measurement so get_hw_latency_measurement() works.
-    // Some models (e.g., older HEFs compiled with prior HailoRT versions) do not
-    // support this flag and will fail configure() with HAILO_INVALID_OPERATION.
-    // Fall back to configuring without the flag when that happens.
-    p->infer_model->set_hw_latency_measurement_flags(HAILO_LATENCY_MEASURE);
+    // HailoRT only supports HW latency measurement on networks with a single
+    // PHYSICAL input; anything else fails configure() with
+    // HAILO_INVALID_OPERATION plus a hailort_server error burst and costs a
+    // full delete/rebuild retry, so skip the flag up front for those
+    // (get_hw_latency* returns 0, same as the retry path below).
+    // Field evidence (on-device, 2026-09-04): an NV12 HEF is ONE InferModel input
+    // that the device splits into y/uv physical inputs, so counting inputs()
+    // alone misses it — also treat multi-plane YUV input orders as
+    // multi-input. Any other INVALID_OPERATION is still handled by the retry.
+    const auto &model_inputs = p->infer_model->inputs();
+    bool multi_physical_input = model_inputs.size() > 1;
+    for (const auto &in : model_inputs)
+    {
+        const hailo_format_order_t order = in.format().order;
+        if (order == HAILO_FORMAT_ORDER_NV12 || order == HAILO_FORMAT_ORDER_NV21 ||
+            order == HAILO_FORMAT_ORDER_I420 || order == HAILO_FORMAT_ORDER_HAILO_YYUV ||
+            order == HAILO_FORMAT_ORDER_HAILO_YYVU || order == HAILO_FORMAT_ORDER_HAILO_YYYYUV)
+        {
+            multi_physical_input = true;
+            break;
+        }
+    }
+    if (multi_physical_input)
+    {
+        HAL_LOG_INFO("hailo15_inference: model '%s' has multi-plane/multiple inputs "
+                     "(%zu stream(s)) — skipping HW latency measurement "
+                     "(single physical input only)",
+                     hef_basename.c_str(), model_inputs.size());
+    }
+    else
+    {
+        p->infer_model->set_hw_latency_measurement_flags(HAILO_LATENCY_MEASURE);
+    }
 
     apply_nms_params(*p->infer_model, *config);
 
