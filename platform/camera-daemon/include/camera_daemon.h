@@ -24,6 +24,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <shared_mutex>
 #include <thread>
 #include <cstdint>
@@ -236,6 +237,14 @@ struct DaemonConfig {
     // Run one refinement one-shot right after the boot park lands on the
     // curve (the job queues immediately and waits for the lens to park).
     int lens_fg2009_af_boot_oneshot = 1;
+
+    // Lens position persistence: archive the last user-settled zoom/focus
+    // (event-driven — the recorder arms on issued motion and writes only
+    // after the motors settle and the position actually changed) and replay
+    // it at boot instead of the config-derived startup position, followed by
+    // one autofocus pass. Survives deploys: /data/aipc/etc/*.json is not
+    // rewritten by deploy.sh.
+    bool lens_position_persistence = true;
 
     AutofocusConfig autofocus;
     IlluminationConfig infrared;
@@ -670,6 +679,36 @@ private:
     std::unique_ptr<grpc::Server> grpc_server_;
     void start_grpc_server();
     void stop_grpc_server();
+
+    // Lens position persistence. The recorder is armed by the lens service's
+    // motion listener (never by init/bootstrap parking), waits for the motors
+    // to settle, and writes /data/aipc/etc/lens_position.json atomically only
+    // when the position changed. The FG2009 restore replaces the boot
+    // one-shot when a model-matching archive exists (AF0832 restores through
+    // the autofocus startup seed instead).
+    struct ArchivedLensPosition {
+        std::string model;
+        float zoom_ratio = 0.0f;
+        int32_t zoom_pos = 0;
+        int32_t focus_pos = 0;
+        int64_t saved_at = 0;  // epoch seconds
+        bool valid() const { return !model.empty(); }
+    };
+    ArchivedLensPosition load_archived_lens_position();
+    bool save_archived_lens_position(const ArchivedLensPosition& pos);
+    void start_lens_position_recorder();
+    void stop_lens_position_recorder();
+    void lens_position_recorder_loop();
+    ArchivedLensPosition lens_archive_cache_;  // guarded by lens_recorder_mu_
+    std::thread lens_recorder_thread_;
+    std::mutex lens_recorder_mu_;
+    std::condition_variable lens_recorder_cv_;
+    std::atomic<bool> lens_recorder_dirty_{false};
+    std::atomic<bool> lens_recorder_stop_{true};
+
+    void fg2009_restore_loop(ArchivedLensPosition pos);
+    std::thread fg2009_restore_thread_;
+    std::atomic<bool> fg2009_restore_stop_{true};
 #endif
 
     bool switch_profile_internal(const std::string& profile_name, bool restart_af,

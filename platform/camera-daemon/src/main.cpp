@@ -684,6 +684,8 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009_af_move_timeout_ms = (int)parse_u32_config(val, "lens.fg2009.af_move_timeout_ms");
                 else if (trimmed.find("focus_curve_path:") != std::string::npos)
                     cfg.lens_fg2009_focus_curve_path = val;
+            } else if (trimmed.find("position_persistence:") != std::string::npos) {
+                cfg.lens_position_persistence = (val == "true" || val == "1");
             }
         }
     }

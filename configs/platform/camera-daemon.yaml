@@ -45,6 +45,13 @@ audio:
 # fg2009 offsets are bench-calibrated bootstrap values — production units
 # may deviate, retune here rather than in code.
 lens:
+  # Archive the last user-settled zoom/focus (event-driven: written only after
+  # the motors settle and the position changed) and restore it at boot,
+  # followed by one autofocus pass. Delete /data/aipc/etc/lens_position.json
+  # to fall back to the config-derived startup position.
+  # NOTE: this key must stay above the fg2009: subsection — the line-based
+  # parser routes everything after fg2009: into that subsection.
+  position_persistence: true
   fg2009:
     ram_steps: 2500         # overshoot that rams the TELE/FAR hard stops
     park_zoom_steps: 2400   # physical steps back from the TELE stop

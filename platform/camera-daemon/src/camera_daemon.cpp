@@ -128,6 +128,13 @@ constexpr const char* kIspConfigPath = "/data/aipc/etc/isp_config.json";
 // (KISS) to match the C++ side's /data/aipc/etc default-root convention.
 constexpr const char* kProfileConfigPath = "/data/aipc/etc/profile_config.json";
 
+// Last user-settled lens position (zoom/focus motor positions + ratio).
+// Same persistence convention as the profile mirror: /data/aipc/etc/*.json
+// survives restarts and deploys. The recorder only rewrites it after the
+// motors settle on a position that differs from the archived one, and the
+// model field makes a lens swap (af0832 <-> fg2009) discard the stale entry.
+constexpr const char* kLensPositionPath = "/data/aipc/etc/lens_position.json";
+
 int dpm_render_mode_from_string(const std::string& s) {
     if (s == "blur") return kDpmRenderBlur;
     if (s == "overlay") return kDpmRenderOverlay;
@@ -2910,6 +2917,242 @@ static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
 }
 
 #ifdef HAS_GRPC
+CameraDaemon::ArchivedLensPosition CameraDaemon::load_archived_lens_position() {
+    ArchivedLensPosition pos;
+    std::ifstream in(kLensPositionPath);
+    if (!in.is_open()) {
+        HAL_LOG_INFO("CameraDaemon: no archived lens position (%s); "
+                     "boot keeps the config-derived startup position",
+                     kLensPositionPath);
+        return pos;
+    }
+    try {
+        const nlohmann::json j = nlohmann::json::parse(in);
+        pos.model = j.at("model").get<std::string>();
+        pos.zoom_pos = j.at("zoom_pos").get<int32_t>();
+        pos.focus_pos = j.at("focus_pos").get<int32_t>();
+        if (j.contains("zoom_ratio")) pos.zoom_ratio = j["zoom_ratio"].get<float>();
+        if (j.contains("saved_at")) pos.saved_at = j["saved_at"].get<int64_t>();
+    } catch (const std::exception& e) {
+        HAL_LOG_WARNING("CameraDaemon: archived lens position malformed (%s); "
+                        "ignoring", e.what());
+        return ArchivedLensPosition{};
+    }
+    if (pos.valid() && pos.model != config_.lens_model) {
+        HAL_LOG_WARNING("CameraDaemon: discarding archived lens position "
+                        "(saved for %s, current lens %s)",
+                        pos.model.c_str(), config_.lens_model.c_str());
+        return ArchivedLensPosition{};
+    }
+    return pos;
+}
+
+bool CameraDaemon::save_archived_lens_position(const ArchivedLensPosition& pos) {
+    const nlohmann::json j = {
+        {"model", pos.model},
+        {"zoom_ratio", pos.zoom_ratio},
+        {"zoom_pos", pos.zoom_pos},
+        {"focus_pos", pos.focus_pos},
+        {"saved_at", pos.saved_at},
+    };
+    const std::string tmp = std::string(kLensPositionPath) + ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        HAL_LOG_WARNING("CameraDaemon: failed to open lens position archive for write: %s",
+                        tmp.c_str());
+        return false;
+    }
+    out << j.dump() << "\n";
+    out.close();
+    if (!out) {
+        HAL_LOG_WARNING("CameraDaemon: failed to write lens position archive: %s",
+                        tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), kLensPositionPath) != 0) {
+        HAL_LOG_WARNING("CameraDaemon: failed to rename lens position archive %s -> %s",
+                        tmp.c_str(), kLensPositionPath);
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+void CameraDaemon::start_lens_position_recorder() {
+    if (!config_.lens_position_persistence || !lens_controller_) return;
+    {
+        // load_archived_lens_position() already discards model mismatches.
+        std::lock_guard<std::mutex> lock(lens_recorder_mu_);
+        lens_archive_cache_ = load_archived_lens_position();
+    }
+    lens_controller_->set_motion_listener([this]() {
+        lens_recorder_dirty_ = true;
+        lens_recorder_cv_.notify_all();
+    });
+    lens_recorder_stop_ = false;
+    lens_recorder_thread_ = std::thread(&CameraDaemon::lens_position_recorder_loop, this);
+    HAL_LOG_INFO("CameraDaemon: lens position recorder armed (%s)", kLensPositionPath);
+}
+
+void CameraDaemon::stop_lens_position_recorder() {
+    if (lens_controller_) lens_controller_->set_motion_listener(nullptr);
+    lens_recorder_stop_ = true;
+    lens_recorder_cv_.notify_all();
+    if (lens_recorder_thread_.joinable()) lens_recorder_thread_.join();
+}
+
+void CameraDaemon::lens_position_recorder_loop() {
+    while (!lens_recorder_stop_) {
+        std::unique_lock<std::mutex> lock(lens_recorder_mu_);
+        lens_recorder_cv_.wait(lock, [this] {
+            return lens_recorder_dirty_.load() || lens_recorder_stop_.load();
+        });
+        if (lens_recorder_stop_) return;
+        lens_recorder_dirty_ = false;
+        lock.unlock();
+
+        // Settle confirm: motors stopped AND two consecutive identical state
+        // reads 300 ms apart. Identical integer positions alone are not
+        // proof — a slow fire-and-forget move can sample the same coarse
+        // position twice mid-flight, and FG2009's dead-reckoned model jumps
+        // to its target at issue time — so the motor-state gate is what
+        // actually marks the move done. If the 10 s cap expires with the
+        // motors still running, skip: keeping the previous archive beats
+        // saving an in-flight sample (no arm fires on natural completion).
+        LensControllerState last{};
+        bool have_last = false;
+        {
+            LensControllerState prev{};
+            bool have_prev = false;
+            for (int waited = 0; waited < 10000 && !lens_recorder_stop_;
+                 waited += 300) {
+                LensControllerState cur{};
+                if (!lens_controller_ ||
+                    lens_controller_->state_get(&cur) != HAL_OK ||
+                    cur.zoom_state != 1 || cur.focus_state != 1) {
+                    // Read error or motors running: restart the settle
+                    // window; a running sample is never a settle candidate.
+                    have_prev = false;
+                    have_last = false;
+                } else if (have_prev && cur.zoom_pos == prev.zoom_pos &&
+                           cur.focus_pos == prev.focus_pos) {
+                    last = cur;
+                    have_last = true;
+                    break;
+                } else {
+                    prev = cur;
+                    have_prev = true;
+                    last = cur;
+                    have_last = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+        }
+        if (!have_last || lens_recorder_stop_) continue;
+
+        ArchivedLensPosition pos;
+        pos.model = config_.lens_model;
+        pos.zoom_ratio = lens_controller_->pos_to_ratio(last.zoom_pos);
+        pos.zoom_pos = last.zoom_pos;
+        pos.focus_pos = last.focus_pos;
+        pos.saved_at = std::time(nullptr);
+
+        std::lock_guard<std::mutex> lock2(lens_recorder_mu_);
+        if (lens_archive_cache_.valid() &&
+            lens_archive_cache_.model == pos.model &&
+            lens_archive_cache_.zoom_pos == pos.zoom_pos &&
+            lens_archive_cache_.focus_pos == pos.focus_pos) {
+            continue;  // boot-restore replays and no-op moves land here
+        }
+        if (save_archived_lens_position(pos)) {
+            lens_archive_cache_ = pos;
+            HAL_LOG_INFO("CameraDaemon: lens position archived "
+                         "(zoom_ratio=%.3f zoom=%d focus=%d)",
+                         static_cast<double>(pos.zoom_ratio),
+                         static_cast<int>(pos.zoom_pos),
+                         static_cast<int>(pos.focus_pos));
+        }
+    }
+}
+
+void CameraDaemon::fg2009_restore_loop(const ArchivedLensPosition pos) {
+    // Mirror AutofocusController::wait_lens_ready: the FG2009 lens parks
+    // during Init (ram + park), so wait for initialized/anchored plus five
+    // consecutive still-motor reads before replaying the archive. Same
+    // readiness budget as autofocus: after an initial MCU failure the
+    // re-init can take well over a minute.
+    const int ready_timeout_ms =
+        std::max(1000, config_.autofocus.startup_ready_timeout_ms);
+    auto motors_still = [this]() {
+        LensControllerState st{};
+        return lens_controller_ &&
+               lens_controller_->state_get(&st) == HAL_OK &&
+               st.zoom_state == 1 && st.focus_state == 1;
+    };
+    int stable_reads = 0;
+    bool ready = false;
+    for (int waited = 0; waited < ready_timeout_ms && !fg2009_restore_stop_;
+         waited += 100) {
+        if (lens_controller_ && lens_controller_->initialized() &&
+            lens_controller_->af0832_bootstrapped() && motors_still()) {
+            if (++stable_reads >= 5) {
+                ready = true;
+                break;
+            }
+        } else {
+            stable_reads = 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!ready) {
+        // The readiness window expired (e.g. the lens parks only after a
+        // slow MCU re-init). The normal boot one-shot was suppressed in
+        // favor of this restore, so queue it here instead — its own
+        // wait_lens_ready runs with a fresh readiness window.
+        HAL_LOG_WARNING("CameraDaemon: fg2009 lens never became ready; "
+                        "skipping archived position restore, falling back "
+                        "to boot autofocus");
+        if (autofocus_controller_) {
+            uint64_t job = 0;
+            std::string error;
+            autofocus_controller_->start_one_shot(&job, &error);
+        }
+        return;
+    }
+
+    constexpr uint32_t kMoveTimeoutMs = 20000;
+    const int zret = lens_controller_->zoom_abs_wait(
+        config_.lens_fg2009.zoom_pps, pos.zoom_pos, kMoveTimeoutMs);
+    const int fret = lens_controller_->focus_abs_wait(
+        config_.lens_fg2009.focus_pps, pos.focus_pos, kMoveTimeoutMs);
+    if (zret != HAL_OK || fret != HAL_OK) {
+        HAL_LOG_WARNING("CameraDaemon: archived lens position restore move failed "
+                        "(zoom=%d focus=%d); falling back to boot autofocus",
+                        zret, fret);
+        if (autofocus_controller_) {
+            uint64_t job = 0;
+            std::string error;
+            autofocus_controller_->start_one_shot(&job, &error);
+        }
+        return;
+    }
+    HAL_LOG_INFO("CameraDaemon: archived lens position restored "
+                 "(zoom_ratio=%.3f zoom=%d focus=%d); autofocus will refine",
+                 static_cast<double>(pos.zoom_ratio),
+                 static_cast<int>(pos.zoom_pos), static_cast<int>(pos.focus_pos));
+    // If the restore zoom delta was zero the zoom-motion observer never
+    // fired and nothing queued a refinement; if it did fire, this enqueue is
+    // rejected while that job is busy. Either way exactly one pass runs.
+    if (autofocus_controller_) {
+        uint64_t job = 0;
+        std::string error;
+        if (autofocus_controller_->start_one_shot(&job, &error)) {
+            HAL_LOG_INFO("CameraDaemon: post-restore autofocus job %llu queued",
+                         static_cast<unsigned long long>(job));
+        }
+    }
+}
+
 void CameraDaemon::start_grpc_server() {
     std::string server_address("unix:///run/aipc/camera-control.sock");
 
@@ -2996,9 +3239,30 @@ void CameraDaemon::start_grpc_server() {
                              ? SelectedMode::Infrared : SelectedMode::Day;
     }
 
+    // Lens position archive: loaded before the autofocus wiring so both the
+    // AF0832 startup seed and the FG2009 restore thread (below) consume it.
+    ArchivedLensPosition lens_archive;
+    if (config_.lens_position_persistence) {
+        lens_archive = load_archived_lens_position();
+    }
+
     AutofocusConfig af_cfg = config_.autofocus;
     if (config_.lens_model == "fg2009") {
         apply_fg2009_autofocus_overrides(config_, &af_cfg);
+    }
+    if (lens_archive.valid()) {
+        // AF0832: replay the archived motor positions as the startup seed
+        // (they already carry the calibration delta the last scan settled
+        // on). FG2009 never runs the startup job (startup_af forced off);
+        // its restore is the dedicated thread below.
+        af_cfg.startup_seed_from_archive = true;
+        af_cfg.startup_seed_zoom_pos = lens_archive.zoom_pos;
+        af_cfg.startup_seed_focus_pos = lens_archive.focus_pos;
+        HAL_LOG_INFO("CameraDaemon: boot will restore archived lens position "
+                     "(zoom=%d focus=%d zoom_ratio=%.3f)",
+                     static_cast<int>(lens_archive.zoom_pos),
+                     static_cast<int>(lens_archive.focus_pos),
+                     static_cast<double>(lens_archive.zoom_ratio));
     }
     if (config_.autofocus.enabled && lens_controller_ && hal_loader_ &&
         hal_loader_->has_isp() && video_source_ && frame_router_) {
@@ -3023,9 +3287,14 @@ void CameraDaemon::start_grpc_server() {
     chmod(sock_path, 0660);
     chown(sock_path, -1, 1001);
 
+    start_lens_position_recorder();
+
     if (autofocus_controller_) {
         autofocus_controller_->start();
-        if (config_.lens_model == "fg2009" && config_.lens_fg2009_af_boot_oneshot) {
+        const bool restore_instead =
+            config_.lens_model == "fg2009" && lens_archive.valid();
+        if (config_.lens_model == "fg2009" && config_.lens_fg2009_af_boot_oneshot &&
+            !restore_instead) {
             // Boot focus: the FG2009 park lands on the INF curve; refine once
             // right after the lens parks.  The queued job blocks in
             // wait_lens_ready until the bootstrap finishes and the motors
@@ -3041,10 +3310,30 @@ void CameraDaemon::start_grpc_server() {
                                 af_error.c_str());
             }
         }
+        if (restore_instead) {
+            // Archived-position replay replaces the boot one-shot: restore
+            // first, then exactly one refinement pass (the restore zoom move
+            // fires on_fg2009_zoom_moved which queues one; the thread's own
+            // enqueue is then rejected as busy — or covers the case where
+            // the zoom delta was zero and nothing fired).
+            fg2009_restore_stop_ = false;
+            fg2009_restore_thread_ = std::thread(
+                &CameraDaemon::fg2009_restore_loop, this, lens_archive);
+        }
     }
 }
 
 void CameraDaemon::stop_grpc_server() {
+    // Join the boot-restore thread first: it moves the lens and enqueues
+    // autofocus jobs, both of which are torn down right after.
+    if (fg2009_restore_thread_.joinable()) {
+        fg2009_restore_stop_ = true;
+        fg2009_restore_thread_.join();
+    }
+    // Stop the lens-position recorder next: its settle reads call into the
+    // lens service, which is torn down below.
+    stop_lens_position_recorder();
+
     if (autofocus_controller_) {
         autofocus_controller_->stop();
         autofocus_controller_.reset();
