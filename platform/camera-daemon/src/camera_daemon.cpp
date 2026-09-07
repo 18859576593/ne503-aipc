@@ -3011,11 +3011,14 @@ void CameraDaemon::lens_position_recorder_loop() {
         lens_recorder_dirty_ = false;
         lock.unlock();
 
-        // Settle confirm: two consecutive identical state reads 300 ms apart.
-        // Wait-method moves are already finished when the arm fires, so they
-        // settle after one interval; fire-and-forget RPC moves take as long
-        // as the motor needs. The 10 s cap matches a stalled-motor escape:
-        // record the last good read rather than hang the recorder.
+        // Settle confirm: motors stopped AND two consecutive identical state
+        // reads 300 ms apart. Identical integer positions alone are not
+        // proof — a slow fire-and-forget move can sample the same coarse
+        // position twice mid-flight, and FG2009's dead-reckoned model jumps
+        // to its target at issue time — so the motor-state gate is what
+        // actually marks the move done. If the 10 s cap expires with the
+        // motors still running, skip: keeping the previous archive beats
+        // saving an in-flight sample (no arm fires on natural completion).
         LensControllerState last{};
         bool have_last = false;
         {
@@ -3025,8 +3028,12 @@ void CameraDaemon::lens_position_recorder_loop() {
                  waited += 300) {
                 LensControllerState cur{};
                 if (!lens_controller_ ||
-                    lens_controller_->state_get(&cur) != HAL_OK) {
-                    have_prev = false;  // read error: restart the settle window
+                    lens_controller_->state_get(&cur) != HAL_OK ||
+                    cur.zoom_state != 1 || cur.focus_state != 1) {
+                    // Read error or motors running: restart the settle
+                    // window; a running sample is never a settle candidate.
+                    have_prev = false;
+                    have_last = false;
                 } else if (have_prev && cur.zoom_pos == prev.zoom_pos &&
                            cur.focus_pos == prev.focus_pos) {
                     last = cur;
@@ -3071,8 +3078,11 @@ void CameraDaemon::lens_position_recorder_loop() {
 void CameraDaemon::fg2009_restore_loop(const ArchivedLensPosition pos) {
     // Mirror AutofocusController::wait_lens_ready: the FG2009 lens parks
     // during Init (ram + park), so wait for initialized/anchored plus five
-    // consecutive still-motor reads before replaying the archive.
-    constexpr int kReadyTimeoutMs = 60000;
+    // consecutive still-motor reads before replaying the archive. Same
+    // readiness budget as autofocus: after an initial MCU failure the
+    // re-init can take well over a minute.
+    const int ready_timeout_ms =
+        std::max(1000, config_.autofocus.startup_ready_timeout_ms);
     auto motors_still = [this]() {
         LensControllerState st{};
         return lens_controller_ &&
@@ -3081,7 +3091,7 @@ void CameraDaemon::fg2009_restore_loop(const ArchivedLensPosition pos) {
     };
     int stable_reads = 0;
     bool ready = false;
-    for (int waited = 0; waited < kReadyTimeoutMs && !fg2009_restore_stop_;
+    for (int waited = 0; waited < ready_timeout_ms && !fg2009_restore_stop_;
          waited += 100) {
         if (lens_controller_ && lens_controller_->initialized() &&
             lens_controller_->af0832_bootstrapped() && motors_still()) {
@@ -3095,8 +3105,18 @@ void CameraDaemon::fg2009_restore_loop(const ArchivedLensPosition pos) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (!ready) {
+        // The readiness window expired (e.g. the lens parks only after a
+        // slow MCU re-init). The normal boot one-shot was suppressed in
+        // favor of this restore, so queue it here instead — its own
+        // wait_lens_ready runs with a fresh readiness window.
         HAL_LOG_WARNING("CameraDaemon: fg2009 lens never became ready; "
-                        "skipping archived position restore");
+                        "skipping archived position restore, falling back "
+                        "to boot autofocus");
+        if (autofocus_controller_) {
+            uint64_t job = 0;
+            std::string error;
+            autofocus_controller_->start_one_shot(&job, &error);
+        }
         return;
     }
 
