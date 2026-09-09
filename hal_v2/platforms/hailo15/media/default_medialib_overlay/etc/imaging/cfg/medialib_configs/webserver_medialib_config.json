@@ -31,7 +31,11 @@
     },
     {
       "name": "Infrared_Basic",
-      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/gst_example_IR_profile.json"
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/AF_IR_profile.json"
+    },
+    {
+      "config_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/gst_example_IR_profile.json",
+      "name": "Infrared_Basic_FG2009"
     }
   ]
 }

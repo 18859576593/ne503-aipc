@@ -115,6 +115,9 @@ autofocus:
 
 infrared:
   enabled: true
+  # Per-lens IR entry in the shared media config: af0832 keeps this name;
+  # fg2009 auto-substitutes "Infrared_Basic_FG2009" at startup (explicit
+  # non-default values are respected for bench tuning).
   profile_name: Infrared_Basic
   default_mode: day
   near_led_id: 0

@@ -213,7 +213,10 @@ if(HAL_PLATFORM STREQUAL "hailo15")
         # ---- SDK's webserver config for the Basic profiles; references rewritten to a scratch
         # ---- dir so no on-device config path is needed at runtime.
         set(HAL_V2_EMBED_DEFAULT_MEDIALIB ON CACHE BOOL "Embed a self-contained default medialib config in the HAL")
-        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic" CACHE STRING "Profiles embedded in the default medialib config")
+        # FORCE: the profile list is source-managed (nothing overrides it via
+        # -D); without FORCE a stale CMakeCache value silently keeps old
+        # profiles out of the bundle on incremental builds.
+        set(HAL_V2_DEFAULT_MEDIALIB_PROFILES "Daylight_Basic,High_Dynamic_Range_Basic,AI_ISP_Gen1_Basic,AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic,Infrared_Basic,Infrared_Basic_FG2009" CACHE STRING "Profiles embedded in the default medialib config" FORCE)
         set(HAL_V2_DEFAULT_MEDIALIB_SCRATCH_ROOT "/var/tmp/hal_medialib_default" CACHE STRING "Runtime scratch dir for the embedded default medialib config")
         set(HAL_V2_DEFAULT_MEDIALIB_WS_CFG "etc/imaging/cfg/medialib_configs/webserver_medialib_config.json" CACHE STRING "Webserver medialib config path (relative to SDK sysroot)")
         get_filename_component(_HAL_SDK_SYSROOT "${HAILO_MEDIALIB_INC_DIR}/../../.." ABSOLUTE)
@@ -225,9 +228,20 @@ if(HAL_PLATFORM STREQUAL "hailo15")
             # iq_settings/calib files regenerate the bundle on incremental builds.
             file(GLOB_RECURSE _HAL_OVERLAY_FILES CONFIGURE_DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay/*")
+            file(GLOB_RECURSE _HAL_REPO_IMAGING_FILES CONFIGURE_DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/../configs/imaging/*")
             add_custom_command(
                 OUTPUT ${_GEN_BUNDLE}
                 COMMAND ${CMAKE_COMMAND} -E make_directory ${_GEN_BUNDLE_DIR}
+                # Fail the build when the compiled-in overlay tree and the
+                # pack-release configs/imaging tree drift apart (retuned file
+                # committed to one tree only, entry added to one container
+                # only, or a dangling config_file ref).
+                COMMAND ${HAL_PYTHON3}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/check_medialib_overlay.py
+                        --overlay ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay
+                        --repo-configs ${CMAKE_CURRENT_SOURCE_DIR}/../configs/imaging
+                        --sysroot ${_HAL_SDK_SYSROOT}
                 COMMAND ${HAL_PYTHON3}
                         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
                         --sysroot ${_HAL_SDK_SYSROOT}
@@ -237,8 +251,10 @@ if(HAL_PLATFORM STREQUAL "hailo15")
                         --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                         --out ${_GEN_BUNDLE}
                 DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/check_medialib_overlay.py
                         ${_HAL_OVERLAY_FILES}
-                COMMENT "Generating self-contained default medialib bundle (5 Basic + Infrared profiles)"
+                        ${_HAL_REPO_IMAGING_FILES}
+                COMMENT "Generating self-contained default medialib bundle (Basic + per-lens Infrared profiles)"
                 VERBATIM
             )
             set(_DEFAULT_MEDIALIB_SOURCES
