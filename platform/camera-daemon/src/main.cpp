@@ -291,6 +291,23 @@ static bool apply_product_lens_model(DaemonConfig& config,
     return true;
 }
 
+/* Per-lens IR profile: both lens versions share one media config, but each
+ * carries its own Infrared_* entry (optics differ, so does the IQ tuning).
+ * When the yaml still has the AF default name, the FG2009 motorized-zoom
+ * lens switches to its own entry; an explicit non-default profile_name is
+ * respected for bench tuning — same contract as the FG2009 IR zoom LUT
+ * substitution. Resolved once here so every later consumer (mode checks,
+ * profile switch, boot persistence guard) sees the effective name. */
+static void apply_lens_infrared_profile(DaemonConfig& config) {
+    if (config.lens_model != "fg2009" ||
+        config.infrared.infrared_profile != "Infrared_Basic") {
+        return;
+    }
+    config.infrared.infrared_profile = "Infrared_Basic_FG2009";
+    HAL_LOG_INFO("FG2009 lens; IR profile -> %s",
+                 config.infrared.infrared_profile.c_str());
+}
+
 static DaemonConfig load_config(const std::string& path) {
     DaemonConfig cfg;
 
@@ -782,10 +799,13 @@ int main(int argc, char** argv) {
     // Load configuration
     DaemonConfig config = load_config(config_path);
     setup_logging(config.log_level, config.log_file, config_path);
-    select_product_media_config_for_infrared(config);
+    // Lens model first: the IR profile name substitution below must happen
+    // before the media-config validation resolves the effective name.
     if (!apply_product_lens_model(config, config_path)) {
         return 1;
     }
+    apply_lens_infrared_profile(config);
+    select_product_media_config_for_infrared(config);
 
     HAL_LOG_INFO("===================================");
     HAL_LOG_INFO("AIPC Camera Daemon v2.0.0");
