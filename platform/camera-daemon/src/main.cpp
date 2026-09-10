@@ -214,11 +214,14 @@ static bool media_config_contains_profile(const std::string& path,
            json.find(quoted_name) != std::string::npos;
 }
 
-static void select_product_media_config_for_infrared(DaemonConfig& config) {
-    static constexpr const char* kProductMediaConfig =
-        "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
-        "medialib_configs/webserver_medialib_config.json";
+/* Pack-installed product media config: the fallback container when the
+ * configured media file does not provide the IR profile. Shared by the
+ * per-lens substitution below and by select_product_media_config_for_infrared. */
+static constexpr const char* kProductMediaConfig =
+    "/data/aipc/etc/imaging/hailo15h/imx678/theia_sl410m/4k/"
+    "medialib_configs/webserver_medialib_config.json";
 
+static void select_product_media_config_for_infrared(DaemonConfig& config) {
     if (!config.infrared.enabled ||
         media_config_contains_profile(config.media_config_path,
                                       config.infrared.infrared_profile)) {
@@ -297,13 +300,33 @@ static bool apply_product_lens_model(DaemonConfig& config,
  * lens switches to its own entry; an explicit non-default profile_name is
  * respected for bench tuning — same contract as the FG2009 IR zoom LUT
  * substitution. Resolved once here so every later consumer (mode checks,
- * profile switch, boot persistence guard) sees the effective name. */
+ * profile switch, boot persistence guard) sees the effective name.
+ *
+ * The substitution only fires when something can actually resolve the new
+ * name: an empty config_path means the compiled-in default bundle (whose
+ * profile list is build-gated to carry both entries), otherwise either the
+ * configured or the pack product container must list it. An upgraded unit
+ * running new binaries against preserved pre-per-lens imaging trees keeps
+ * the shared Infrared_Basic entry (correct FG2009 tuning) instead of
+ * renaming into a profile nothing can serve — night mode degrades to the
+ * previous behavior rather than failing HAL_ERR_PROFILE_INVALID. */
 static void apply_lens_infrared_profile(DaemonConfig& config) {
     if (config.lens_model != "fg2009" ||
         config.infrared.infrared_profile != "Infrared_Basic") {
         return;
     }
-    config.infrared.infrared_profile = "Infrared_Basic_FG2009";
+    static const std::string kFg2009IrProfile = "Infrared_Basic_FG2009";
+    if (!config.media_config_path.empty() &&
+        !media_config_contains_profile(config.media_config_path,
+                                       kFg2009IrProfile) &&
+        !media_config_contains_profile(kProductMediaConfig, kFg2009IrProfile)) {
+        HAL_LOG_WARNING("FG2009 lens but no media config provides '%s'; keeping "
+                        "'%s' (upgrade the imaging trees for per-lens IR)",
+                        kFg2009IrProfile.c_str(),
+                        config.infrared.infrared_profile.c_str());
+        return;
+    }
+    config.infrared.infrared_profile = kFg2009IrProfile;
     HAL_LOG_INFO("FG2009 lens; IR profile -> %s",
                  config.infrared.infrared_profile.c_str());
 }

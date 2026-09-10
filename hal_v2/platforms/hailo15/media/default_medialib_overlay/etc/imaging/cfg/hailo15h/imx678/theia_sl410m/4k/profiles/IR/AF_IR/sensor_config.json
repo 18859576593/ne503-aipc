@@ -14,7 +14,7 @@
     },
     "sensor_id": "SENSOR_0"
   },
-  "sensor_calibration_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/gst_example_IR/calib.json",
+  "sensor_calibration_file": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/profiles/IR/AF_IR/calib.json",
   "sensor_configuration": {
     "af_i2c_addr": "0x0",
     "af_i2c_bus": -1,

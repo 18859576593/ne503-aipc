@@ -494,6 +494,18 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     {
         std::string persisted_profile;
         if (load_profile_config(&persisted_profile)) {
+            // Pre-per-lens images persisted the shared IR entry name. Map it
+            // to this lens's effective entry so the guard and the replay use
+            // the same name the daemon would switch to (and so the guard
+            // still recognizes it as an infrared profile to force day on
+            // boot, instead of replaying the other lens's IQ tuning).
+            if (persisted_profile == "Infrared_Basic" &&
+                config_.infrared.infrared_profile == "Infrared_Basic_FG2009") {
+                HAL_LOG_INFO("CameraDaemon: mapping persisted IR profile '%s' -> '%s' (per-lens)",
+                             persisted_profile.c_str(),
+                             config_.infrared.infrared_profile.c_str());
+                persisted_profile = config_.infrared.infrared_profile;
+            }
             std::string current = get_current_profile();
             const bool force_day_on_boot = config_.infrared.enabled &&
                 config_.infrared.default_mode != "infrared";

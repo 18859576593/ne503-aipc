@@ -242,6 +242,7 @@ if(HAL_PLATFORM STREQUAL "hailo15")
                         --overlay ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/default_medialib_overlay
                         --repo-configs ${CMAKE_CURRENT_SOURCE_DIR}/../configs/imaging
                         --sysroot ${_HAL_SDK_SYSROOT}
+                        --profiles ${HAL_V2_DEFAULT_MEDIALIB_PROFILES}
                 COMMAND ${HAL_PYTHON3}
                         ${CMAKE_CURRENT_SOURCE_DIR}/platforms/hailo15/media/gen_default_medialib_bundle.py
                         --sysroot ${_HAL_SDK_SYSROOT}

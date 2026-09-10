@@ -90,6 +90,12 @@ def main():
     ap.add_argument("--sysroot", default="",
                     help="Optional SDK sysroot; the pack tree is SDK base + repo "
                          "overlay, so container refs may resolve in either.")
+    ap.add_argument("--profiles", default="",
+                    help="Comma-separated profile list embedded in the compiled-in "
+                         "bundle (HAL_V2_DEFAULT_MEDIALIB_PROFILES). Every overlay "
+                         "container entry must appear in it: the bundle generator "
+                         "silently drops container entries not on the list, so a "
+                         "forgotten CMake update would ship bench/field divergence.")
     args = ap.parse_args()
 
     overlay = args.overlay.rstrip("/")
@@ -116,9 +122,23 @@ def main():
             _fail(f"profile '{name}' config_file differs: overlay={cf} "
                   f"repo={rp_entries[name]}")
 
+    # 1b. Embed-list gate: the bundle trims to --profiles, so an overlay
+    # container entry missing from the CMake list never reaches the bench.
+    embed = [s.strip() for s in args.profiles.split(",") if s.strip()]
+    if embed:
+        dropped = [n for n in sorted(ov_entries) if n not in embed]
+        if dropped:
+            _fail(f"profile(s) {dropped} are in the overlay container but not in "
+                  f"the embed list (HAL_V2_DEFAULT_MEDIALIB_PROFILES); the bundle "
+                  f"generator would silently drop them — update the CMake list")
+
     # 2/3. File-level subset over the shared cfg/hailo15h profile tree, plus
     # existence of every container entry's config_file inside its own tree.
     ov_root = os.path.join(overlay, "etc", "imaging", PROFILE_TREE_REL)
+    if not os.path.isdir(ov_root):
+        # os.walk over a missing dir yields nothing — without this guard a
+        # deleted overlay profile tree would pass vacuously with 0 files.
+        _fail(f"overlay profile tree missing: {ov_root}")
     rp_root = os.path.join(repo, PROFILE_TREE_REL)
     checked = 0
     for dirpath, _dirnames, filenames in os.walk(ov_root):

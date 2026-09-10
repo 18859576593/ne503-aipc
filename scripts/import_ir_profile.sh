@@ -46,7 +46,21 @@ IQ="$SRC/iq_settings.json"
 [[ -f "$IQ" ]] || die "no iq_settings.json in $SRC"
 python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$IQ" \
     || die "iq_settings.json is not valid JSON"
-[[ -f "${TREES[0]}/$DEST_REL/iq_settings.json" ]] || die "destination dir missing: ${TREES[0]}/$DEST_REL"
+for tree in "${TREES[@]}"; do
+    [[ -f "$tree/$DEST_REL/iq_settings.json" ]] || die "destination dir missing: $tree/$DEST_REL"
+done
+
+# The consistency check needs the SDK sysroot (vendor profiles resolve only
+# there). Resolve it BEFORE touching either tree so a missing SDK cannot turn
+# a successful import into a failure. Uses the repo's HAILO_SDK_PATH
+# convention (Makefile/pack_release.sh), with SDK_PATH and the bench default
+# as fallbacks.
+SDK_CANDIDATES=("${HAILO_SDK_PATH:-}" "${SDK_PATH:-}" "/opt/hailo-sdk" "$HOME/Desktop/hailo-sdk-4.0.23")
+SYSROOT=""
+for c in "${SDK_CANDIDATES[@]}"; do
+    [[ -n "$c" && -d "$c/sysroots/armv8a-poky-linux" ]] && { SYSROOT="$c/sysroots/armv8a-poky-linux"; break; }
+done
+[[ -n "$SYSROOT" ]] || die "SDK sysroot not found (set HAILO_SDK_PATH); the post-import consistency check cannot run"
 
 for tree in "${TREES[@]}"; do
     dest="$tree/$DEST_REL"
@@ -57,6 +71,7 @@ for tree in "${TREES[@]}"; do
             [[ -f "$SRC/$base" ]] || continue
             cp "$SRC/$base" "$dest/$base"; n=$((n + 1))
         done
+        [[ "$n" -gt 0 ]] || die "full sync copied 0 files into $dest (source has no matching files?)"
         info "full sync: $n files -> $dest"
     else
         cp "$IQ" "$dest/iq_settings.json"
@@ -66,12 +81,7 @@ done
 
 # Same verification the build runs, so a bad import fails here, not in CI.
 # --overlay takes the overlay root (the check joins etc/imaging/... itself).
-SYSROOT="${SDK_PATH:-$HOME/Desktop/hailo-sdk-4.0.23}/sysroots/armv8a-poky-linux"
 CHECK="$REPO_ROOT/hal_v2/platforms/hailo15/media/check_medialib_overlay.py"
 OVERLAY_ROOT="$REPO_ROOT/hal_v2/platforms/hailo15/media/default_medialib_overlay"
-if [[ -d "$SYSROOT" ]]; then
-    python3 "$CHECK" --overlay "$OVERLAY_ROOT" --repo-configs "${TREES[0]}" --sysroot "$SYSROOT"
-else
-    python3 "$CHECK" --overlay "$OVERLAY_ROOT" --repo-configs "${TREES[0]}"
-fi
+python3 "$CHECK" --overlay "$OVERLAY_ROOT" --repo-configs "${TREES[0]}" --sysroot "$SYSROOT"
 info "done ($LENS, mode=${MODE:-iq-only}); rebuild camera-daemon to refresh the compiled-in bundle"
