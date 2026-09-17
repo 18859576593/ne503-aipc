@@ -76,9 +76,18 @@ struct DspServiceConfig {
     /* Max pixels per op: source plane and (summed) destination planes. */
     uint64_t max_pixels_per_op = 8294400; /* 3840*2160 */
     /* PLAT-4 quota anchors (dma-buf figures, per owning client):
-     * single-op resize ~1500 ops/s, multi-crop N=7 ~6500 rects/s. */
+     * single-op resize ~1500 ops/s, multi-crop N=7 ~6500 rects/s.
+     * MPix/s charging counts src + summed dst pixels per op (see
+     * submit_job's charge_mpix). On that basis one 4K→1080p resize
+     * (10.4 MPix/op) sustained ~42ms/op ≈ 247 MPix/s with per-call pool
+     * reuse — the 720p-era 120 rejected half its calls. 240 lets that
+     * measured flow run essentially unthrottled while two saturated
+     * clients exactly fill quota_total_mpix_per_sec (2×240=480) and a
+     * third throttles globally; a faster fully-offered flow (a pipelined
+     * 4K@30 resize charges ~311 src+dst) self-paces a few percent
+     * against its own bucket instead of eating the shared total. */
     double quota_jobs_per_sec = 100.0;
-    double quota_mpix_per_sec = 120.0;
+    double quota_mpix_per_sec = 240.0;
     double quota_total_jobs_per_sec = 400.0;
     double quota_total_mpix_per_sec = 480.0;
     uint32_t job_timeout_ms = 2000;
@@ -483,6 +492,13 @@ private:
         QuotaKey resource_key = QuotaKey::for_legacy_fd(-1);
         BufferPoolKey pool_key;
         HalFrameBuffer* fb = nullptr;
+        /* Retention provenance: for a buffer served from the park, the
+         * SOURCE pool's full chunk it keeps alive (captured at the pop);
+         * 0 for a fresh buffer from this call's pool. Release-side park
+         * accounting charges this instead of pool_key, so a reusing
+         * call's smaller chunk_n never shrinks the charge below the
+         * vendor chunk actually pinned. */
+        uint64_t park_chunk_bytes = 0;
         uint64_t retained_import_bytes = 0;
         uint32_t pins = 0;      /* held by queued/running jobs            */
         bool detached = false;  /* removed from registry, pending free    */
@@ -677,8 +693,26 @@ private:
     struct ParkedBuffer {
         HalFrameBuffer* fb;
         std::chrono::steady_clock::time_point deadline;
+        uint64_t chunk_bytes; /* provenance: the pool chunk this buffer
+                                * keeps alive — its SOURCE pool's chunk,
+                                * handed back to the reusing alloc via
+                                * take_parked (see BufferEntry::
+                                * park_chunk_bytes) */
     };
-    std::map<ParkedGeometry, std::deque<ParkedBuffer>> parked_;
+    /* One geometry's parked buffers plus the ledger entry for them: the
+     * footprint is credited ONCE per residency (first park, the chunk
+     * that first buffer keeps alive) and debited by exactly that
+     * remembered amount when the residency ends — never by whatever
+     * chunk the front/back buffer happens to carry, because a deque can
+     * legitimately mix chunks (count-raised pools of the same geometry)
+     * and debiting a different chunk would strand a residual in
+     * parked_footprint_ forever. */
+    struct ParkedQueue {
+        std::deque<ParkedBuffer> bufs;
+        uint64_t added_chunk = 0; /* the credited chunk — debited whole
+                                   * on eviction / reuse-drain / sweep */
+    };
+    std::map<ParkedGeometry, ParkedQueue> parked_;
     std::deque<ParkedGeometry> parked_order_; /* first-park order — whole-
                                                * geometry LRU eviction */
     uint64_t parked_footprint_ = 0; /* chunk-accurate bytes parked        */
@@ -687,21 +721,39 @@ private:
      * drain_pending_releases() after the lock drops. Reserved in start()
      * because detach_entry_locked pushes here on a noexcept path. */
     std::vector<HalFrameBuffer*> pending_release_;
-    /* caller holds buffers_mu_; parks fb or queues it into
-     * pending_release_, then evicts whole oldest geometries while
-     * parked_footprint_ exceeds the cap (evictions queued the same
-     * way). Refuses when not running or retention is disabled — fb is
+    /* caller holds buffers_mu_; parks fb (chunk_bytes = the full pool
+     * chunk this buffer keeps alive) or queues it into pending_release_,
+     * then evicts whole oldest geometries while parked_footprint_ exceeds
+     * the cap (evictions queued the same way). Refuses when not running,
+     * retention is disabled, or the chunk alone exceeds the cap — fb is
      * queued for release instead. */
-    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb);
+    void park_or_free_locked(const ParkedGeometry& g, HalFrameBuffer* fb,
+                             uint64_t chunk_bytes);
     /* swaps pending_release_ under buffers_mu_ and HAL-releases outside
      * it; call only with buffers_mu_ NOT held */
     void drain_pending_releases() noexcept;
     /* takes buffers_mu_ itself (alloc path runs lock-free): drops expired
      * front entries of g (HAL-released after unlock), pops one reusable
-     * buffer or returns nullptr. Counts retention_reuses on a hit. */
-    HalFrameBuffer* take_parked(const ParkedGeometry& g);
+     * buffer or returns nullptr. On a reuse, *provenance_chunk (when
+     * given) receives the SOURCE pool's chunk that buffer keeps alive —
+     * the alloc path stamps it on the registry entry
+     * (park_chunk_bytes) so the release-side park charge matches the
+     * chunk actually pinned, not this call's pool sizing. Counts
+     * retention_reuses on a hit. */
+    HalFrameBuffer* take_parked(const ParkedGeometry& g,
+                                uint64_t* provenance_chunk = nullptr);
     /* caller holds buffers_mu_; moves every expired park to to_free. */
     void sweep_parked_locked(std::vector<HalFrameBuffer*>& to_free);
+    /* Retention-oriented HAL pool chunk size for a geometry: HALF the
+     * parking budget's worth of buffers (min-stride estimate, lightly
+     * padded for alignment the estimate can't see), floored at
+     * kMinPoolChunkBuffers (4 — an eighth of the fd ceiling, NOT hal_v2's
+     * 8-buffer app-pool default) and ceilinged at the fd ceiling
+     * kPoolChunkBuffers; the fd ceiling itself when retention is off or
+     * the geometry won't estimate. Defined in dsp_service.cpp next to
+     * the constants it clamps between. */
+    uint32_t retention_pool_chunk_n(uint32_t width, uint32_t height,
+                                    HalPixelFormat format) const noexcept;
 
     // Cross-process lookup leases (DSP_LOOKUP): per-connection map of
     // buffer_id → pins taken by that connection. OWN mutex: pin_buffer and
