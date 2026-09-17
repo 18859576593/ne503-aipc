@@ -136,9 +136,11 @@ struct Hailo15InferPriv
  *
  * Cross-process sharing: the VDevice is shared with camera-daemon's medialib
  * AI-ISP by joining its group_id (kSharedVDeviceGroupId = the medialib
- * hailort.device-id "device0") via hailort_server. A mismatched group makes the
- * server refuse ai-runtime's attach with HAILO_DEVICE_IN_USE(73) as soon as a
- * model loads while AI-ISP is active.
+ * hailort.device-id "device0") via hailort_server. A mismatched group makes
+ * the server refuse the attach outright (verified on-device 2026-09-15:
+ * HAILO_OUT_OF_PHYSICAL_DEVICES(74) at VDevice::create — "requested: 1,
+ * found: 0"; DEVICE_IN_USE(73) is the non-service direct-attach code), so
+ * any override must be a deliberate exclusive run.
  *
  * Cached for the process lifetime; only reset_shared_vdevice() clears it (on
  * the connection-lost recovery path). Each model holds a shared_ptr copy, so
@@ -147,38 +149,59 @@ struct Hailo15InferPriv
  */
 static std::mutex g_shared_vdevice_mu;
 static std::shared_ptr<hailort::VDevice> g_shared_vdevice;
+/** Group the singleton was created with (first-wins; sticky across resets so
+ *  a connection-lost rebuild keeps a deliberate override). Read under
+ *  g_shared_vdevice_mu. */
+static std::string g_shared_vdevice_group;
 
 // group_id shared with camera-daemon's medialib AI-ISP VDevice. Must equal the
-// medialib's hailort.device-id ("device0"); a mismatch makes hailort_server
-// refuse the second attach (HAILO_DEVICE_IN_USE 73) and breaks NPU coexistence.
+// medialib's hailort.device-id ("device0"); any other group makes hailort_server
+// refuse this attach (74/73, see above) and breaks NPU coexistence.
 static constexpr const char *kSharedVDeviceGroupId = "device0";
 
-static std::shared_ptr<hailort::VDevice> get_shared_vdevice()
+static std::shared_ptr<hailort::VDevice> get_shared_vdevice(const char *group_override = nullptr)
 {
     std::lock_guard<std::mutex> lock(g_shared_vdevice_mu);
     if (g_shared_vdevice)
+    {
+        if (group_override && group_override[0]
+            && g_shared_vdevice_group != group_override)
+        {
+            // Process-wide singleton: first creation wins. A later caller asking
+            // for a different group gets the existing one — silently switching
+            // would split the scheduler or break the AI-ISP coexistence group.
+            HAL_LOG_WARNING("hailo15_inference: shared VDevice already on group '%s'; "
+                            "ignoring requested group '%s' (first-wins)",
+                            g_shared_vdevice_group.c_str(), group_override);
+        }
         return g_shared_vdevice;
+    }
 
     hailo_vdevice_params_t params = {};
     hailo_init_vdevice_params(&params);
 
     // Join the medialib AI-ISP's group so ai-runtime and AI-ISP share the single NPU
     // via hailort_server. The medialib opens its VDevice with group_id = its hailort.device-id
-    // ("device0"); the former default "aipc" made the server refuse the second attach with
-    // HAILO_DEVICE_IN_USE(73) -> OUT_OF_PHYSICAL_DEVICES(74) as soon as a model loaded while
-    // AI-ISP was active. Same group + multi_process_service lets HailoRT pipeline both
-    // consumers' network groups on the one physical device.
-    params.group_id = kSharedVDeviceGroupId;
+    // ("device0"); a different group (the former default "aipc" did) makes the server refuse
+    // the attach with HAILO_OUT_OF_PHYSICAL_DEVICES(74) while AI-ISP is active. Same group +
+    // multi_process_service lets HailoRT pipeline both consumers' network groups on the one
+    // physical device.
+    params.group_id = (group_override && group_override[0])
+                          ? group_override
+                          : (g_shared_vdevice_group.empty() ? kSharedVDeviceGroupId
+                                                            : g_shared_vdevice_group.c_str());
     params.multi_process_service = true;
     params.scheduling_algorithm = HAILO_SCHEDULING_ALGORITHM_ROUND_ROBIN;
 
     auto exp = hailort::VDevice::create(params);
     if (!exp)
     {
-        HAL_LOG_ERROR("hailo15_inference: shared VDevice create failed (status=%d)", (int)exp.status());
+        HAL_LOG_ERROR("hailo15_inference: shared VDevice create failed (group='%s', status=%d)",
+                      params.group_id, (int)exp.status());
         return nullptr;
     }
     g_shared_vdevice = exp.release();
+    g_shared_vdevice_group = params.group_id;
     HAL_LOG_INFO("hailo15_inference: created shared VDevice (group='%s', multi_process_service=1, scheduler=ROUND_ROBIN)",
                  params.group_id);
     return g_shared_vdevice;
@@ -216,6 +239,10 @@ static inline bool hailo15_vdevice_connection_lost(hailo_status st)
  * nothing cached, so callers can rate-limit logging.
  *
  * Returns true iff the singleton was actually reset.
+ *
+ * g_shared_vdevice_group deliberately survives the reset: a rebuild via
+ * get_shared_vdevice(nullptr) re-uses it, so a deliberate vdevice_group_id
+ * override stays in effect across hailort_server restarts.
  */
 static bool reset_shared_vdevice()
 {
@@ -276,7 +303,7 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
     {
         const auto &name = p->input_names[i];
         const HalTensor &in = inputs[i];
-        if (!in.data || in.byte_size == 0)
+        if (in.byte_size == 0)
             return HAL_ERR_INVALID_ARG;
         const size_t frame_size = p->infer_model->input(name)->get_frame_size();
         if (in.byte_size != frame_size)
@@ -285,23 +312,65 @@ static int hailo15_bind_inputs_outputs(Hailo15InferPriv *p, const HalTensor *inp
                           frame_size);
             return HAL_ERR_INVALID_SIZE;
         }
-        hailo_status st;
-        if (in.dma_fd >= 0)
+        if (!in.data)
         {
-            /* Zero-copy: bind the dma-buf fd directly (HailoRT Linux; the
-             * driver maps the buffer into the VDMA channel with no CPU copy).
-             * The underlying memory must stay valid for the transfer lifetime
-             * (sync run returns after completion; async until the callback). */
-            st = p->bindings.input(name)->set_dma_buffer(hailo_dma_buffer_t{in.dma_fd, in.byte_size});
+            /* DMA-bound input, zero CPU pixels. Preferred route: the
+             * HalDmaFrameDesc from bind_dma_frame() / the tensor_from_frame
+             * dma fast path — it carries the per-plane layout. Fallback: a
+             * bare tensor->dma_fd over one compact buffer. In both cases the
+             * underlying memory must stay valid for the transfer lifetime
+             * (sync run returns after completion; async until the callback).
+             * The descriptor is re-applied on every submit — works under
+             * submit_mtx and with future ping-pong bindings. */
+            auto *tp = static_cast<TensorPriv *>(in.priv);
+            const HalDmaFrameDesc *d = tp ? tp->dma_frame : nullptr;
+            hailo_status st;
+            if (d)
+            {
+                if (d->fd[1] >= 0)
+                {
+                    /* dual-fd NV12: one dmabuf per plane (path A) */
+                    hailo_pix_buffer_t pb = {};
+                    pb.memory_type = HAILO_PIX_BUFFER_MEMORY_TYPE_DMABUF;
+                    pb.number_of_planes = 2;
+                    pb.planes[0].fd = d->fd[0];
+                    pb.planes[0].bytes_used = d->bytes_used[0];
+                    pb.planes[0].plane_size = d->bytes_used[0];
+                    pb.planes[1].fd = d->fd[1];
+                    pb.planes[1].bytes_used = d->bytes_used[1];
+                    pb.planes[1].plane_size = d->bytes_used[1];
+                    st = p->bindings.input(name)->set_pix_buffer(pb);
+                }
+                else
+                {
+                    /* single compact NV12 dmabuf (path B1) */
+                    st = p->bindings.input(name)->set_dma_buffer(
+                        hailo_dma_buffer_t{d->fd[0], (size_t)d->bytes_used[0]});
+                }
+            }
+            else if (in.dma_fd >= 0)
+            {
+                st = p->bindings.input(name)->set_dma_buffer(hailo_dma_buffer_t{in.dma_fd, in.byte_size});
+            }
+            else
+            {
+                return HAL_ERR_INVALID_ARG;
+            }
+            if (HAILO_SUCCESS != st)
+            {
+                HAL_LOG_ERROR("hailo15_inference: dma bind input[%zu] failed (st=%d, dma_fd=%d)", i, (int)st,
+                              in.dma_fd);
+                return HAL_ERR_RESULT;
+            }
         }
         else
         {
-            st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
-        }
-        if (HAILO_SUCCESS != st)
-        {
-            HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d, dma_fd=%d)", (int)st, in.dma_fd);
-            return HAL_ERR_RESULT;
+            hailo_status st = p->bindings.input(name)->set_buffer(hailort::MemoryView(in.data, in.byte_size));
+            if (HAILO_SUCCESS != st)
+            {
+                HAL_LOG_ERROR("hailo15_inference: set input buffer failed (st=%d)", (int)st);
+                return HAL_ERR_RESULT;
+            }
         }
     }
 
@@ -999,7 +1068,18 @@ static HalInferenceSession *hailo15_infer_create(const HalInferenceConfig *confi
 
     // Acquire shared VDevice — enables HailoRT ROUND_ROBIN scheduling across
     // all models so the NPU can pipeline inference for multiple network groups.
-    p->vdevice = get_shared_vdevice();
+    // An explicit runtime handle (from runtime_acquire(), possibly carrying a
+    // vdevice_group_id override) reuses the VDevice it was created with; the
+    // handle-less path joins the process singleton on the shared group.
+    if (config->runtime)
+    {
+        auto *runtime_handle = reinterpret_cast<Hailo15RuntimeHandle *>(config->runtime);
+        p->vdevice = runtime_handle->vdevice;
+    }
+    else
+    {
+        p->vdevice = get_shared_vdevice();
+    }
     if (!p->vdevice)
     {
         HAL_LOG_ERROR("hailo15_inference: failed to acquire shared VDevice");
@@ -1335,6 +1415,65 @@ static int hailo15_infer_tensor_from_frame(const HalFrameBuffer *frame, HalTenso
 {
     if (!frame || !tensor)
         return HAL_ERR_INVALID_ARG;
+
+    /* ---- P1-1 dma fast path: compact dual-plane NV12 with per-plane
+     * dmabufs binds straight to the NPU (zero CPU pixel copies). The
+     * vendor pool this HAL requests buffers from allocates exactly this
+     * layout (one dmabuf per plane, stride == width — see
+     * MediaLibraryBufferPool's 6-arg ctor delegating with
+     * bytes_per_line=width), so DPM's pre-resized model-geometry inputs
+     * take this path. Geometry-vs-model is still enforced at bind time
+     * (byte_size == frame_size check), so a mismatched frame fails
+     * cleanly exactly like the CPU path did. Anything off-contract
+     * (no fds, padded stride, non-NV12) falls through to memcpy staging. */
+    if (frame->format == HAL_PIX_FMT_NV12 &&
+        frame->num_planes >= 2 &&
+        frame->dma_fds[0] >= 0 && frame->dma_fds[1] >= 0 &&
+        frame->strides[0] == frame->width && frame->strides[1] == frame->width)
+    {
+        HalDmaFrameDesc desc{};
+        desc.fd[0] = frame->dma_fds[0];
+        desc.fd[1] = frame->dma_fds[1];
+        desc.fd[2] = -1; /* plane absent */
+        desc.offset[0] = 0;
+        desc.offset[1] = 0;
+        desc.stride[0] = frame->width;
+        desc.stride[1] = frame->width;
+        desc.bytes_used[0] = frame->width * frame->height;
+        desc.bytes_used[1] = frame->width * frame->height / 2;
+        desc.format = HAL_PIX_FMT_NV12;
+        desc.width = frame->width;
+        desc.height = frame->height;
+        desc.borrowed = 1; /* fds stay owned by the HalFrameBuffer */
+
+        auto *desc_copy = new (std::nothrow) HalDmaFrameDesc(desc);
+        auto *tp = new (std::nothrow) TensorPriv{};
+        if (!desc_copy || !tp)
+        {
+            delete desc_copy;
+            delete tp;
+            return HAL_ERR_NO_MEM;
+        }
+        tp->dma_frame = desc_copy;
+
+        static std::atomic<bool> s_dma_bind_logged{false};
+        if (!s_dma_bind_logged.exchange(true))
+        {
+            HAL_LOG_INFO("hailo15_inference: tensor_from_frame dma direct-bind engaged "
+                         "(%ux%u NV12 dual-fd, zero CPU copies)",
+                         (unsigned)frame->width, (unsigned)frame->height);
+        }
+
+        const uint32_t total = desc.bytes_used[0] + desc.bytes_used[1];
+        std::memset(tensor, 0, sizeof(*tensor));
+        tensor->dma_fd = frame->dma_fds[0]; /* data stays NULL: no CPU pixels */
+        tensor->ndim = 1;
+        tensor->shape[0] = (int32_t)total;
+        tensor->dtype = HAL_DTYPE_UINT8;
+        tensor->byte_size = total;
+        tensor->priv = tp;
+        return HAL_OK;
+    }
 
     uint32_t plane0_sz = 0;
     uint32_t plane1_sz = 0;
@@ -1718,6 +1857,116 @@ static int hailo15_infer_tensor_from_frame_ex(HalInferenceSession *session,
 #endif
 }
 
+/* ========== DMA frame direct-bind (P0-2, adjudicated by tools/npu-bind-probe
+ * on rig 2026-09-15: dual-fd set_pix_buffer(DMABUF) and single-compact-fd
+ * set_dma_buffer both PASS with byte-identical outputs) ========== */
+
+static int hailo15_infer_bind_dma_frame(HalInferenceSession *session, const HalDmaFrameDesc *frame, HalTensor *out)
+{
+    if (!session || !frame || !out)
+        return HAL_ERR_INVALID_ARG;
+
+    /* Layout validation is platform-independent. */
+    if (frame->format != HAL_PIX_FMT_NV12)
+        return HAL_ERR_NOT_SUPPORTED;
+    const uint32_t w = frame->width, h = frame->height;
+    if (w == 0 || h == 0 || w > (0xFFFFFFFFu / h))
+        return HAL_ERR_INVALID_ARG;
+    const uint64_t y_len64 = (uint64_t)w * h;
+    const uint64_t nv12_len64 = y_len64 + (y_len64 / 2);
+    if (nv12_len64 > 0xFFFFFFFFu)
+        return HAL_ERR_INVALID_ARG;
+    const uint32_t y_len = (uint32_t)y_len64;
+    const uint32_t uv_len = (uint32_t)(y_len64 / 2);
+
+    const bool dual = frame->fd[1] >= 0;
+    const uint32_t planes = dual ? 2u : 1u;
+    for (uint32_t i = 0; i < planes; i++)
+    {
+        /* HailoRT 5.3.0 has no per-plane offset/stride: compact layout only.
+         * Same geometry with padding stride is NOT bindable (尺寸相同≠可直绑). */
+        if (frame->fd[i] < 0 || frame->offset[i] != 0 || frame->stride[i] != w)
+            return HAL_ERR_NOT_SUPPORTED;
+    }
+    if (dual)
+    {
+        if (frame->bytes_used[0] != y_len || frame->bytes_used[1] != uv_len)
+            return HAL_ERR_INVALID_SIZE;
+    }
+    else
+    {
+        if (frame->bytes_used[0] != y_len + uv_len)
+            return HAL_ERR_INVALID_SIZE;
+    }
+
+#if !defined(HAL_HAVE_HAILORT)
+    (void)session;
+    (void)frame;
+    (void)out;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    auto *p = reinterpret_cast<Hailo15InferPriv *>(session);
+    if (p->input_names.empty())
+        return HAL_ERR_INVALID_ARG;
+    const auto &name = p->input_names[0];
+    const size_t frame_size = p->infer_model->input(name)->get_frame_size();
+    if (frame_size != (size_t)nv12_len64)
+    {
+        HAL_LOG_ERROR("hailo15_inference: bind_dma_frame geometry mismatch (desc=%llux%llu -> %llu bytes, input '%s' wants %zu)",
+                      (unsigned long long)w, (unsigned long long)h, (unsigned long long)nv12_len64, name.c_str(), frame_size);
+        return HAL_ERR_INVALID_SIZE;
+    }
+
+    auto *desc_copy = new (std::nothrow) HalDmaFrameDesc(*frame);
+    if (!desc_copy)
+        return HAL_ERR_NO_MEM;
+    auto *tp = new (std::nothrow) TensorPriv{};
+    if (!tp)
+    {
+        delete desc_copy;
+        return HAL_ERR_NO_MEM;
+    }
+    tp->dma_frame = desc_copy;
+
+    std::memset(out, 0, sizeof(*out));
+    out->dma_fd = frame->fd[0]; /* data stays NULL: no CPU pixels on this path */
+    out->ndim = 1;
+    out->shape[0] = (int32_t)nv12_len64;
+    out->dtype = HAL_DTYPE_UINT8;
+    out->byte_size = (uint32_t)nv12_len64;
+    std::snprintf(out->name, sizeof(out->name), "%s", name.c_str());
+    out->priv = tp;
+    return HAL_OK;
+#endif
+}
+
+static int hailo15_infer_probe_capability(uint32_t cap_id, int32_t *out)
+{
+    if (!out)
+        return HAL_ERR_INVALID_ARG;
+#if !defined(HAL_HAVE_HAILORT)
+    (void)cap_id;
+    return HAL_ERR_NOT_SUPPORTED;
+#else
+    /* Static verdicts from the 2026-09-15 device adjudication; the live
+     * authority is tools/npu-bind-probe. */
+    switch (cap_id)
+    {
+    case HAL_INFER_CAP_PIXBUF_DMABUF:
+        *out = 1; /* set_pix_buffer DMABUF dual-plane: PASS, byte-identical */
+        return HAL_OK;
+    case HAL_INFER_CAP_DMABUF_SINGLE:
+        *out = 1; /* set_dma_buffer single compact fd: PASS, byte-identical */
+        return HAL_OK;
+    case HAL_INFER_CAP_STREAM_ASYNC_FD:
+        *out = 0; /* vdev->configure(): HAILO_NOT_IMPLEMENTED on this stack */
+        return HAL_OK;
+    default:
+        return HAL_ERR_INVALID_ARG;
+    }
+#endif
+}
+
 static int hailo15_infer_run(HalInferenceSession *session,
                              const HalTensor *inputs, int num_inputs,
                              HalTensor *outputs, int num_outputs)
@@ -1890,23 +2139,38 @@ static int hailo15_infer_run_async(HalInferenceSession *session,
 /**
  * Acquire a handle to the shared NPU runtime. The HEAD design shares one
  * ROUND_ROBIN VDevice across every model session, so every acquired runtime
- * is backed by the same scheduler — the @p config is accepted for API
- * compatibility but the singleton's scheduling wins. */
+ * is backed by the same scheduler. A non-empty @p config->vdevice_group_id
+ * seeds the singleton's group at first creation (mirroring the GenAI
+ * implementation); the singleton is process-lifetime, so a later acquire
+ * asking for a different group keeps the existing one (WARN in
+ * get_shared_vdevice). algorithm / multi_process_service stay at the
+ * platform defaults (ROUND_ROBIN + hailort_server) — group is the one knob
+ * this honors, and it must match the medialib hailort.device-id unless the
+ * caller deliberately wants an exclusive run.
+ */
 static HalInferenceRuntime *hailo15_infer_runtime_acquire(const HalInferenceRuntimeConfig *config)
 {
 #if !defined(HAL_HAVE_HAILORT)
     (void)config;
     return nullptr;
 #else
-    (void)config;
-    auto vdev = get_shared_vdevice();
+    const char *group_override = nullptr;
+    if (config && config->vdevice_group_id[0] != '\0')
+        group_override = config->vdevice_group_id;
+    auto vdev = get_shared_vdevice(group_override);
     if (!vdev)
         return nullptr;
     auto *wrapper = new (std::nothrow) Hailo15RuntimeHandle();
     if (!wrapper)
         return nullptr;
     wrapper->vdevice = vdev;
-    HAL_LOG_INFO("hailo15_inference: runtime_acquire group=aipc algorithm=ROUND_ROBIN");
+    std::string group_str;
+    {
+        std::lock_guard<std::mutex> lock(g_shared_vdevice_mu);
+        group_str = g_shared_vdevice_group;
+    }
+    HAL_LOG_INFO("hailo15_inference: runtime_acquire group='%s' algorithm=ROUND_ROBIN multi_process_service=1",
+                 group_str.c_str());
     return reinterpret_cast<HalInferenceRuntime *>(wrapper);
 #endif
 }
@@ -1933,6 +2197,7 @@ static void hailo15_infer_free_tensor(HalTensor *tensor)
     if (tensor->priv)
     {
         auto *tp = static_cast<TensorPriv *>(tensor->priv);
+        delete tp->dma_frame; /* owned desc copy from bind_dma_frame() */
         delete tp;
     }
     std::memset(tensor, 0, sizeof(*tensor));
@@ -2063,6 +2328,9 @@ HalInferenceOps HAL_INFERENCE_OPS = {
     .get_version = hailo15_infer_get_version,
     /* M3 additions (appended at the table tail, after get_version) */
     .tensor_from_frame_ex = hailo15_infer_tensor_from_frame_ex,
+    /* P0-2 additions (DMA direct-bind contract; NULL on platforms without it) */
+    .bind_dma_frame = hailo15_infer_bind_dma_frame,
+    .probe_capability = hailo15_infer_probe_capability,
 };
 
 } // extern "C"
