@@ -143,8 +143,8 @@ infrared:
 light_sensor:
   enabled: true
   auto_on_boot: false        # start in auto mode on boot (else default_mode from infrared)
-  night_enter: 28            # light_percent <= night_enter => switch to night
-  day_enter: 82              # light_percent >= day_enter   => switch to day
+  night_enter: 25            # light_percent <= night_enter => switch to night (25% ≈ 11.68 lux, bench)
+  day_enter: 80              # light_percent >= day_enter   => switch to day (80% ≈ 25.36 lux, bench)
   sample_interval_ms: 500    # photodiode sampling cadence
   stable_samples: 3          # consecutive qualifying reads before a switch
   dark_mv: 4                 # measured dark-environment endpoint (calibration)
