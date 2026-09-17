@@ -7,15 +7,22 @@
 #include "fd_receiver.h"
 #include "event_bus_client.h"
 #include "postprocess_pool.h"
+#include "stream_infer_utils.h"
 #include "config.h"
 #include "model/hal_clip_text_encoder_ops.h"
 #include "model/hal_genai.h"
 
 #include <grpcpp/grpcpp.h>
+#include <future>
+#include <memory>
 #include <unordered_map>
+#include <vector>
 #include <mutex>
 
 namespace aipc::ai_runtime {
+
+class DspClient;
+class StreamPreprocessPool;
 
 class AIRuntimeServiceImpl final
     : public aipc::inference::InferenceService::Service {
@@ -27,6 +34,7 @@ public:
                          FdReceiver* fd_receiver,
                          EventBusClient* event_bus,
                          PostprocessPool* postprocess_pool,
+                         DspClient* dsp_client,
                          const HalClipTextEncoderOps* clip_enc_ops,
                          const HalGenaiOps* genai_ops);
 
@@ -133,15 +141,28 @@ private:
     // Static so its address is a plain function pointer fit for
     // HalInferenceOps::run_async.
     static void InferBatchCallback(HalTensor* outputs, int num_outputs,
-                                   int status, void* userdata);
+                                   int status, void* userdata) noexcept;
+
+    std::shared_ptr<StreamPreprocessPool> acquire_stream_preprocess_pool(
+        uint32_t width, uint32_t height);
 
     const Config&        cfg_;
+    StreamAdmissionController stream_admission_;
     ModelManager*        model_mgr_;
     SessionManager*     session_mgr_;
     InferenceScheduler*  scheduler_;
     FdReceiver*          fd_receiver_;
     EventBusClient*      event_bus_;
     PostprocessPool*     postprocess_pool_;
+    DspClient*           dsp_client_;      // stream DSP preprocess
+    std::mutex            dsp_pool_mu_;
+    using StreamPoolPtr = std::shared_ptr<StreamPreprocessPool>;
+    std::unordered_map<uint64_t, std::weak_ptr<StreamPreprocessPool>>
+        dsp_pools_;                         // current pool per geometry
+    std::vector<std::weak_ptr<StreamPreprocessPool>>
+        dsp_pool_instances_;                // counts retired pools until destroyed
+    std::unordered_map<uint64_t, std::shared_future<StreamPoolPtr>>
+        dsp_pool_inits_;                    // one allocator per geometry
     const HalClipTextEncoderOps* clip_enc_ops_;
     const HalGenaiOps* genai_ops_;
     std::mutex genai_mu_;
