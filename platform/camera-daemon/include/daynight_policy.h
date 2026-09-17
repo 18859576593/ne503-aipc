@@ -28,8 +28,8 @@ struct LightSensorConfig
 {
     bool enabled = true;
     bool auto_on_boot = false;       /* start in auto mode on boot */
-    int night_enter = 28;           /* light_percent <= night_enter => Night */
-    int day_enter = 82;             /* light_percent >= day_enter   => Day   */
+    int night_enter = 25;           /* light_percent <= night_enter => Night (25% ≈ 11.68 lux, bench) */
+    int day_enter = 80;             /* light_percent >= day_enter   => Day   (80% ≈ 25.36 lux, bench) */
     int sample_interval_ms = 500;   /* sampling cadence of the auto monitor */
     int stable_samples = 3;         /* consecutive qualifying reads before a switch */
     int dark_mv = 4;                /* measured dark-environment endpoint (calibration) */

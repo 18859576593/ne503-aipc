@@ -140,6 +140,13 @@ constexpr const char* kProfileConfigPath = "/data/aipc/etc/profile_config.json";
 // model field makes a lens swap (af0832 <-> fg2009) discard the stale entry.
 constexpr const char* kLensPositionPath = "/data/aipc/etc/lens_position.json";
 
+// Operator-tuned day/night switch thresholds (web sliders -> set_light_thresholds).
+// Same persistence convention as the lens-position archive: /data/aipc/etc/*.json
+// survives restart/deploy, and the mirror overrides the YAML defaults at boot so
+// the operator's tuning survives a power cycle. Delete the file to fall back to
+// the YAML values.
+constexpr const char* kDayNightThresholdsPath = "/data/aipc/etc/daynight_thresholds.json";
+
 int dpm_render_mode_from_string(const std::string& s) {
     if (s == "blur") return kDpmRenderBlur;
     if (s == "overlay") return kDpmRenderOverlay;
@@ -3436,6 +3443,76 @@ static void apply_fg2009_autofocus_overrides(const DaemonConfig& cfg,
     af->startup_ready_timeout_ms = 300000;
 }
 
+namespace {
+
+/* Day/night threshold persistence mirror — see kDayNightThresholdsPath for the
+ * convention. Load validates the pair before returning it; anything malformed
+ * or out of range keeps the YAML defaults. */
+struct DayNightThresholds {
+    int night_enter = 0;
+    int day_enter = 0;
+};
+
+bool load_daynight_thresholds(DayNightThresholds* out) {
+    std::ifstream in(kDayNightThresholdsPath);
+    if (!in.is_open()) {
+        HAL_LOG_INFO("CameraDaemon: no persisted day/night thresholds (%s); "
+                     "using YAML defaults", kDayNightThresholdsPath);
+        return false; /* no mirror yet: YAML defaults stand */
+    }
+    int night_enter = 0;
+    int day_enter = 0;
+    try {
+        const nlohmann::json j = nlohmann::json::parse(in);
+        night_enter = j.at("night_enter").get<int>();
+        day_enter = j.at("day_enter").get<int>();
+    } catch (const std::exception& e) {
+        HAL_LOG_WARNING("CameraDaemon: day/night threshold mirror malformed (%s); "
+                        "keeping YAML defaults", e.what());
+        return false;
+    }
+    std::string err;
+    if (!validate_light_thresholds(night_enter, day_enter, &err)) {
+        HAL_LOG_WARNING("CameraDaemon: day/night threshold mirror invalid (%s); "
+                        "keeping YAML defaults", err.c_str());
+        return false;
+    }
+    out->night_enter = night_enter;
+    out->day_enter = day_enter;
+    return true;
+}
+
+bool save_daynight_thresholds(int night_enter, int day_enter) {
+    const nlohmann::json j = {
+        {"night_enter", night_enter},
+        {"day_enter", day_enter},
+        {"saved_at", static_cast<int64_t>(std::time(nullptr))},
+    };
+    const std::string tmp = std::string(kDayNightThresholdsPath) + ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        HAL_LOG_WARNING("CameraDaemon: failed to open day/night threshold mirror for write: %s",
+                        tmp.c_str());
+        return false;
+    }
+    out << j.dump() << "\n";
+    out.close();
+    if (!out) {
+        HAL_LOG_WARNING("CameraDaemon: failed to write day/night threshold mirror: %s",
+                        tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), kDayNightThresholdsPath) != 0) {
+        HAL_LOG_WARNING("CameraDaemon: failed to rename day/night threshold mirror %s -> %s",
+                        tmp.c_str(), kDayNightThresholdsPath);
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 #ifdef HAS_GRPC
 CameraDaemon::ArchivedLensPosition CameraDaemon::load_archived_lens_position() {
     ArchivedLensPosition pos;
@@ -3749,6 +3826,16 @@ void CameraDaemon::start_grpc_server() {
     {
         std::lock_guard<std::mutex> lk(daynight_mu_);
         light_sensor_cfg_ = config_.light_sensor;
+        /* Operator-tuned thresholds (web sliders) outlive restarts via the
+         * mirror file; once present they own the values, YAML is the fallback. */
+        DayNightThresholds tuned;
+        if (load_daynight_thresholds(&tuned)) {
+            light_sensor_cfg_.night_enter = tuned.night_enter;
+            light_sensor_cfg_.day_enter = tuned.day_enter;
+            HAL_LOG_INFO("CameraDaemon: restored day/night thresholds "
+                         "night_enter=%d day_enter=%d from %s",
+                         tuned.night_enter, tuned.day_enter, kDayNightThresholdsPath);
+        }
         daynight_state_.mode = LightMode::Day;
     }
     if (config_.light_sensor.enabled && config_.light_sensor.auto_on_boot) {
@@ -5315,10 +5402,20 @@ bool CameraDaemon::set_light_thresholds(int night_enter, int day_enter, std::str
         if (message) *message = err;
         return false;
     }
-    std::lock_guard<std::mutex> lk(daynight_mu_);
-    light_sensor_cfg_.night_enter = night_enter;
-    light_sensor_cfg_.day_enter = day_enter;
-    daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
+    {
+        std::lock_guard<std::mutex> lk(daynight_mu_);
+        light_sensor_cfg_.night_enter = night_enter;
+        light_sensor_cfg_.day_enter = day_enter;
+        daynight_state_.stable_count = 0; /* reset accumulation on threshold change */
+        /* Persist under daynight_mu_ (same convention as write_ir_presets_locked):
+         * keeps the file-write order identical to the member-update order when
+         * two SetInfraredSettings RPCs race. Best-effort — a write failure only
+         * costs the across-reboot tuning, not this session. */
+        if (!save_daynight_thresholds(night_enter, day_enter)) {
+            HAL_LOG_WARNING("CameraDaemon: day/night thresholds applied but not persisted "
+                            "(night_enter=%d day_enter=%d)", night_enter, day_enter);
+        }
+    }
     HAL_LOG_INFO("CameraDaemon: light thresholds updated night_enter=%d day_enter=%d",
                  night_enter, day_enter);
     return true;
