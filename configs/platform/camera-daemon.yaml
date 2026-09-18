@@ -40,10 +40,11 @@ audio:
   mute: false
   # audio_library: optional, monolithic libaipc_hal.so includes HAL_AUDIO_OPS
 
-# Lens geometry overrides. The lens model itself comes from
-# /data/aipc/etc/product.yaml (baked at pack time, LENS_PRODUCT); these
-# fg2009 offsets are bench-calibrated bootstrap values — production units
-# may deviate, retune here rather than in code.
+# Lens geometry overrides. The lens model itself comes from the factory
+# EEPROM HWREV field (factory-station burned; af0832 when unprogrammed) —
+# product.yaml no longer selects the lens. These fg2009 offsets are
+# bench-calibrated bootstrap values — production units may deviate,
+# retune here rather than in code.
 lens:
   # Archive the last user-settled zoom/focus (event-driven: written only after
   # the motors settle and the position changed) and restore it at boot,
@@ -147,6 +148,7 @@ light_sensor:
   day_enter: 80              # light_percent >= day_enter   => switch to day (80% ≈ 25.36 lux, bench)
   sample_interval_ms: 500    # photodiode sampling cadence
   stable_samples: 3          # consecutive qualifying reads before a switch
+  min_hold_s: 15             # anti-flap dwell: after an applied switch, hold this long before allowing another
   dark_mv: 4                 # measured dark-environment endpoint (calibration)
   bright_mv: 1909            # measured bright-environment endpoint (calibration)
 

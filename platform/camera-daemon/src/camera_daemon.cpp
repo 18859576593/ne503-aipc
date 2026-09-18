@@ -3453,6 +3453,15 @@ struct DayNightThresholds {
     int day_enter = 0;
 };
 
+/* Steady-clock milliseconds since epoch — monotonic time feed for the
+ * day/night anti-flap dwell (immune to the wall-clock jumps bench boards see). */
+static uint64_t daynight_steady_now_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
 bool load_daynight_thresholds(DayNightThresholds* out) {
     std::ifstream in(kDayNightThresholdsPath);
     if (!in.is_open()) {
@@ -5204,16 +5213,31 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
         if (ok) ok = illumination_controller_->set_mode(ImagingMode::Infrared, ratio, &error);
         if (ok) ok = wait_stable();
         if (ok) {
-            day_profile_before_infrared_ = previous_profile;
+            // Capture the profile to return to ONLY on a genuine day->IR crossing.
+            // Re-entering IR while already on the IR profile (gate-2 no-op skip, or
+            // an auto-monitor re-assert after a throttled switch) must not overwrite
+            // the remembered day profile with the IR profile itself — that turned
+            // every later day-mode apply into "already on Infrared_Basic, skipped"
+            // and left the pipeline stuck in night IQ (bench log 2026-09-10 16:31).
+            if (previous_profile != config_.infrared.infrared_profile) {
+                day_profile_before_infrared_ = previous_profile;
+            }
             // Always boot into the saved daytime/AI profile. Infrared remains
             // an explicit mode selection and is never replayed after reboot.
-            persist_profile_config(previous_profile);
+            persist_profile_config(day_profile_before_infrared_.empty()
+                                       ? previous_profile
+                                       : day_profile_before_infrared_);
         }
     } else {
         illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
         ok = set_ircut(0);
-        const std::string day_profile = day_profile_before_infrared_.empty()
-            ? "Daylight_Basic" : day_profile_before_infrared_;
+        // Sanitize a poisoned capture (equal to the IR profile) so a day-mode
+        // apply can never resolve to "stay on infrared".
+        const std::string day_profile =
+            day_profile_before_infrared_.empty() ||
+                    day_profile_before_infrared_ == config_.infrared.infrared_profile
+                ? "Daylight_Basic"
+                : day_profile_before_infrared_;
         if (ok) ok = switch_profile_internal(day_profile, false, &error);
         if (ok) ok = wait_stable();
     }
@@ -5313,6 +5337,7 @@ void CameraDaemon::light_monitor_loop() {
 
         if (sel == SelectedMode::Auto) {
             const LightSample sample = read_light_sample();
+            const uint64_t now_ms = daynight_steady_now_ms();
             bool apply = false;
             LightMode apply_target = LightMode::Day;
             {
@@ -5320,19 +5345,33 @@ void CameraDaemon::light_monitor_loop() {
                 if (selected_mode_ == SelectedMode::Auto) {
                     const bool lens_active =
                         (lens_controller_ && lens_controller_->autofocus_operation_active());
+                    const uint64_t hold_ms =
+                        light_sensor_cfg_.min_hold_ms > 0
+                            ? static_cast<uint64_t>(light_sensor_cfg_.min_hold_ms)
+                            : 0u;
                     const auto decision =
-                        evaluate(daynight_state_, sample, light_sensor_cfg_, lens_active);
+                        evaluate(daynight_state_, sample, light_sensor_cfg_, lens_active, now_ms);
                     if (decision == LightSwitchDecision::ToDay ||
                         decision == LightSwitchDecision::ToNight) {
                         apply = true;
                         apply_target = daynight_state_.mode;
-                    } else if (daynight_state_.has_pending && !lens_active) {
-                        /* apply a switch that was deferred while a lens/AF op was active */
+                    } else if (decision == LightSwitchDecision::Held) {
+                        HAL_LOG_DEBUG(
+                            "CameraDaemon: day/night switch confirmed but held "
+                            "(min_hold_ms=%u, light percent=%d)",
+                            static_cast<unsigned>(light_sensor_cfg_.min_hold_ms),
+                            sample.percent);
+                    } else if (daynight_state_.has_pending && !lens_active &&
+                               (daynight_state_.last_switch_ms == 0 ||
+                                now_ms - daynight_state_.last_switch_ms >= hold_ms)) {
+                        /* apply a switch that was deferred while a lens/AF op was active;
+                         * a pending switch still respects the anti-flap dwell */
                         apply = true;
                         apply_target = daynight_state_.pending_target;
                         daynight_state_.has_pending = false;
                         daynight_state_.mode = apply_target;
                         daynight_state_.stable_count = 0;
+                        daynight_state_.last_switch_ms = now_ms;
                     }
                 }
             }
@@ -5375,6 +5414,9 @@ bool CameraDaemon::set_selected_mode(const std::string& mode, std::string* messa
             daynight_state_.mode = optical_night ? LightMode::Night : LightMode::Day;
             daynight_state_.stable_count = 0;
             daynight_state_.has_pending = false;
+            /* Entering auto arms the anti-flap dwell so the monitor cannot
+             * immediately undo the optical state the operator just left. */
+            daynight_state_.last_switch_ms = daynight_steady_now_ms();
         }
         start_light_monitor();
         HAL_LOG_INFO("CameraDaemon: selected mode = auto (light-driven)");
