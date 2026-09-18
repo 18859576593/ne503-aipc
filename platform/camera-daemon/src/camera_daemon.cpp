@@ -5212,16 +5212,31 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
         if (ok) ok = illumination_controller_->set_mode(ImagingMode::Infrared, ratio, &error);
         if (ok) ok = wait_stable();
         if (ok) {
-            day_profile_before_infrared_ = previous_profile;
+            // Capture the profile to return to ONLY on a genuine day->IR crossing.
+            // Re-entering IR while already on the IR profile (gate-2 no-op skip, or
+            // an auto-monitor re-assert after a throttled switch) must not overwrite
+            // the remembered day profile with the IR profile itself — that turned
+            // every later day-mode apply into "already on Infrared_Basic, skipped"
+            // and left the pipeline stuck in night IQ (bench log 2026-09-10 16:31).
+            if (previous_profile != config_.infrared.infrared_profile) {
+                day_profile_before_infrared_ = previous_profile;
+            }
             // Always boot into the saved daytime/AI profile. Infrared remains
             // an explicit mode selection and is never replayed after reboot.
-            persist_profile_config(previous_profile);
+            persist_profile_config(day_profile_before_infrared_.empty()
+                                       ? previous_profile
+                                       : day_profile_before_infrared_);
         }
     } else {
         illumination_controller_->set_mode(ImagingMode::Day, ratio, nullptr);
         ok = set_ircut(0);
-        const std::string day_profile = day_profile_before_infrared_.empty()
-            ? "Daylight_Basic" : day_profile_before_infrared_;
+        // Sanitize a poisoned capture (equal to the IR profile) so a day-mode
+        // apply can never resolve to "stay on infrared".
+        const std::string day_profile =
+            day_profile_before_infrared_.empty() ||
+                    day_profile_before_infrared_ == config_.infrared.infrared_profile
+                ? "Daylight_Basic"
+                : day_profile_before_infrared_;
         if (ok) ok = switch_profile_internal(day_profile, false, &error);
         if (ok) ok = wait_stable();
     }
