@@ -277,7 +277,6 @@ var aipcServices = []string{
 	"ai-runtime",
 	"device-control",
 	"device-discovery",
-	"onvif-device",
 	"platform-api",
 	"app-manager",
 	"aipc-nginx-gateway",
