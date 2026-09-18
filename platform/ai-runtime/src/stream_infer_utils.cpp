@@ -273,9 +273,24 @@ FrameRateGate::FrameRateGate(uint32_t fps) {
 
 bool FrameRateGate::allow(TimePoint now) {
     if (interval_ == std::chrono::nanoseconds::zero()) return true;
-    if (now < next_allowed_) return false;
-    next_allowed_ = now + interval_;
-    return true;
+    // Accrue at fps_limit per second of wall time, capped so a stall banks
+    // at most kMaxCredits of catch-up. Every allow() spends exactly 1.0, so
+    // the sustained submit rate is min(fps_limit, source rate) — the
+    // indivisible-cap subharmonic lock (15fps capped at 10 -> 7.5fps) cannot
+    // happen: a skipped frame's credit is banked for the next arrival.
+    if (now > last_) {
+        const double elapsed_s =
+            std::chrono::duration<double>(now - last_).count();
+        const double interval_s =
+            static_cast<double>(interval_.count()) / 1e9;
+        credits_ = std::min(kMaxCredits, credits_ + elapsed_s / interval_s);
+        last_ = now;
+    }
+    if (credits_ >= 1.0) {
+        credits_ -= 1.0;
+        return true;
+    }
+    return false;
 }
 
 bool apply_result_filters(

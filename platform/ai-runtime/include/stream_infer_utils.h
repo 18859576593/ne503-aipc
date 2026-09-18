@@ -115,8 +115,17 @@ public:
     bool allow(TimePoint now);
 
 private:
+    // Ratio (credit-bucket) pacing: credits accrue at fps_limit per second,
+    // a frame is submitted the moment it arrives with >=1 credit banked, and
+    // accrual is capped at kMaxCredits so a source stall never banks more
+    // than that much catch-up. Sustained submit rate converges to
+    // min(fps_limit, source rate) regardless of divisibility — a hard
+    // time-threshold ceiling locks to source/k subharmonics when k frames
+    // per interval isn't integral (15fps capped at 10 submitted 7.5fps).
     std::chrono::nanoseconds interval_{};
-    TimePoint next_allowed_ = TimePoint::min();
+    double credits_ = 1.0;  // first frame passes
+    TimePoint last_{};
+    static constexpr double kMaxCredits = 2.0;
 };
 
 bool apply_result_filters(
