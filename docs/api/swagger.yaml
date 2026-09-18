@@ -8400,6 +8400,9 @@ components:
         line_thickness:
           type: integer
           format: uint32
+        enable_face_blur:
+          type: boolean
+          description: Mosaic detections labeled face; omit to preserve the current setting.
 
     MediaOsdConfig:
       type: object
