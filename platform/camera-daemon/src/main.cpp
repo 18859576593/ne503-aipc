@@ -303,11 +303,153 @@ static std::string read_eeprom_lens_model(const DaemonConfig& config) {
     return model;
 }
 
-/* Applies the lens model identity: the factory EEPROM HWREV field (burned at
- * the factory station) is the single source; product.yaml is no longer
- * consulted. When the EEPROM carries no recognized model the daemon defaults
- * to af0832 rather than failing, so an unprogrammed unit still boots. */
+/* Adaptive lens probe (differential iris test). AF0832 carries a physical
+ * iris driven by a Hall closed loop; FG2009 has none — iris register writes
+ * still succeed (the driver chip is shared), but the ADC reading cannot move.
+ * Drive the iris to a target far from the current reading and re-read:
+ * movement toward the target = af0832, no movement = fg2009. Runs before the
+ * lens service owns the UART: opens the lens bridge, probes, tears the
+ * session down (the service re-initializes the MCU afterwards, same as a
+ * daemon restart). Returns "af0832"/"fg2009", or "" when the probe could not
+ * run (no bridge, MCU not answering, ambiguous movement) so the caller falls
+ * back to the factory EEPROM. */
+static std::string probe_lens_model(const DaemonConfig& config) {
+    const std::string& lib_path = config.lens_bridge_lib;
+    if (lib_path.empty()) {
+        HAL_LOG_INFO("Lens probe: no lens bridge configured; skipped");
+        return "";
+    }
+    void* handle = dlopen(lib_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        HAL_LOG_INFO("Lens probe: cannot load '%s' (%s)", lib_path.c_str(), dlerror());
+        return "";
+    }
+    using IoInitFn = int (*)(const char*, uint32_t, uint32_t);
+    using HandleFn = int (*)(int);
+    using ModeFn = int (*)(int, int);
+    using RunFn = int (*)(int, int, int);
+    using AdcFn = int (*)(int, void*);
+    IoInitFn io_init = nullptr;
+    HandleFn io_deinit = nullptr, lens_init = nullptr, lens_deinit = nullptr,
+             iris_stop = nullptr;
+    ModeFn lens_config = nullptr;
+    RunFn iris_run = nullptr;
+    ModeFn iris_target_set = nullptr;  // (handle, target)
+    AdcFn iris_adc_get = nullptr;
+    *reinterpret_cast<void**>(&io_init) = dlsym(handle, "hal_bridge_io_init");
+    *reinterpret_cast<void**>(&io_deinit) = dlsym(handle, "hal_bridge_io_deinit");
+    *reinterpret_cast<void**>(&lens_init) = dlsym(handle, "hal_bridge_lens_init");
+    *reinterpret_cast<void**>(&lens_deinit) = dlsym(handle, "hal_bridge_lens_deinit");
+    *reinterpret_cast<void**>(&lens_config) = dlsym(handle, "hal_bridge_lens_config");
+    *reinterpret_cast<void**>(&iris_run) = dlsym(handle, "hal_bridge_iris_run");
+    *reinterpret_cast<void**>(&iris_stop) = dlsym(handle, "hal_bridge_iris_stop");
+    *reinterpret_cast<void**>(&iris_target_set) = dlsym(handle, "hal_bridge_iris_target_set");
+    *reinterpret_cast<void**>(&iris_adc_get) = dlsym(handle, "hal_bridge_iris_adc_get");
+    if (!io_init || !io_deinit || !lens_init || !lens_deinit || !lens_config ||
+        !iris_run || !iris_stop || !iris_target_set || !iris_adc_get) {
+        HAL_LOG_INFO("Lens probe: '%s' missing lens/iris symbols; skipped", lib_path.c_str());
+        dlclose(handle);
+        return "";
+    }
+
+    std::string result;
+    if (io_init(config.lens_serial_device.c_str(),
+                config.lens_baud_rate, config.lens_timeout_ms) == 0) {
+        int ret = lens_init(1);
+        if (ret != 0) {  // same retry shape as the lens service Init RPC
+            lens_deinit(1);
+            usleep(100 * 1000);
+            ret = lens_init(1);
+        }
+        const int cfg_ret = ret == 0 ? lens_config(1, 0) : ret;
+        if (cfg_ret != 0) {
+            HAL_LOG_WARNING("Lens probe: MCU session failed (init=%d cfg=%d); falling back",
+                            ret, cfg_ret);
+        } else {
+            usleep(200 * 1000);  // let the MCU finish applying the config
+            /* First read after boot can race the MCU's own init; retry. */
+            auto read_adc = [&](uint16_t* out) -> int {
+                for (int attempt = 1; attempt <= 3; ++attempt) {
+                    const int ret = iris_adc_get(1, out);
+                    if (ret == 0) return 0;
+                    HAL_LOG_WARNING("Lens probe: iris ADC read attempt %d failed (ret=%d)",
+                                    attempt, ret);
+                    usleep(250 * 1000);
+                }
+                return -1;
+            };
+            uint16_t a0 = 0, a0b = 0, a1 = 0;
+            if (read_adc(&a0) != 0 || read_adc(&a0b) != 0) {
+                HAL_LOG_WARNING("Lens probe: iris ADC unreadable; falling back");
+            } else {
+                /* Target far from the current reading so a converged iris
+                 * cannot already sit on it (10-bit ADC scale). */
+                int target;
+                if (a0 < 512) {
+                    target = static_cast<int>(a0b) + 400;
+                    if (target > 1023) target = 1023;
+                } else {
+                    target = static_cast<int>(a0b) - 400;
+                    if (target < 0) target = 0;
+                }
+                iris_target_set(1, target);
+                iris_run(1, 0, 0);
+                usleep(1200 * 1000);  // iris mechanical settle
+                const int get_ret = read_adc(&a1);
+                iris_stop(1);
+                iris_target_set(1, a0b);  // restore pre-probe target (no-op w/o iris)
+                if (get_ret != 0) {
+                    HAL_LOG_WARNING("Lens probe: iris ADC re-read failed; falling back");
+                } else {
+                    const int moved = static_cast<int>(a1) > static_cast<int>(a0b)
+                                          ? static_cast<int>(a1) - static_cast<int>(a0b)
+                                          : static_cast<int>(a0b) - static_cast<int>(a1);
+                    const int d_new = static_cast<int>(a1) > target
+                                          ? static_cast<int>(a1) - target
+                                          : target - static_cast<int>(a1);
+                    const int d_old = static_cast<int>(a0b) > target
+                                          ? static_cast<int>(a0b) - target
+                                          : target - static_cast<int>(a0b);
+                    HAL_LOG_INFO("Lens probe: iris adc %u->%u (target %d, moved %d%s)",
+                                 a0b, a1, target, moved, a0 != a0b ? ", base noisy" : "");
+                    if (moved >= 40 && d_new < d_old) {
+                        result = "af0832";
+                    } else if (moved < 40) {
+                        result = "fg2009";
+                    } else {
+                        HAL_LOG_WARNING("Lens probe: ambiguous movement; falling back");
+                    }
+                }
+            }
+        }
+        lens_deinit(1);
+        io_deinit(1);
+    } else {
+        HAL_LOG_WARNING("Lens probe: io_init on %s failed; falling back",
+                        config.lens_serial_device.c_str());
+    }
+    dlclose(handle);
+    return result;
+}
+
+/* Applies the lens model identity: the adaptive iris probe decides first;
+ * the factory EEPROM HWREV field (burned at the factory station) is the
+ * fallback when the probe cannot run; af0832 is the last-resort default so
+ * an unprogrammed unit still boots. A probe/EEPROM conflict warns and the
+ * probe wins. */
 static void apply_lens_model_identity(DaemonConfig& config) {
+    const std::string probed = probe_lens_model(config);
+    if (!probed.empty()) {
+        const std::string eeprom_model = read_eeprom_lens_model(config);
+        if (!eeprom_model.empty() && eeprom_model != probed) {
+            HAL_LOG_WARNING("Lens model conflict: probe '%s' vs factory EEPROM '%s' "
+                            "— probe wins",
+                            probed.c_str(), eeprom_model.c_str());
+        }
+        config.lens_model = probed;
+        HAL_LOG_INFO("Lens product model: %s (adaptive iris probe)", probed.c_str());
+        return;
+    }
     const std::string eeprom_model = read_eeprom_lens_model(config);
 
     if (!eeprom_model.empty()) {
@@ -317,7 +459,7 @@ static void apply_lens_model_identity(DaemonConfig& config) {
         return;
     }
     config.lens_model = "af0832";
-    HAL_LOG_INFO("Lens product model: af0832 (factory EEPROM carries no lens model)");
+    HAL_LOG_INFO("Lens product model: af0832 (probe and EEPROM carry no lens model)");
 }
 
 /* Per-lens IR profile: both lens versions share one media config, but each
