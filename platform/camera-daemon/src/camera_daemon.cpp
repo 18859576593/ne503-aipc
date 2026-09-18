@@ -3462,7 +3462,8 @@ static uint64_t daynight_steady_now_ms() {
             .count());
 }
 
-bool load_daynight_thresholds(DayNightThresholds* out) {    std::ifstream in(kDayNightThresholdsPath);
+bool load_daynight_thresholds(DayNightThresholds* out) {
+    std::ifstream in(kDayNightThresholdsPath);
     if (!in.is_open()) {
         HAL_LOG_INFO("CameraDaemon: no persisted day/night thresholds (%s); "
                      "using YAML defaults", kDayNightThresholdsPath);
