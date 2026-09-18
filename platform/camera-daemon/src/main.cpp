@@ -782,6 +782,8 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.light_sensor.sample_interval_ms = static_cast<int>(parse_u32_config(val, "light_sensor.sample_interval_ms", 60000));
             else if (trimmed.find("stable_samples:") != std::string::npos)
                 cfg.light_sensor.stable_samples = static_cast<int>(parse_u32_config(val, "light_sensor.stable_samples", 100));
+            else if (trimmed.find("min_hold_s:") != std::string::npos)
+                cfg.light_sensor.min_hold_ms = static_cast<int>(parse_u32_config(val, "light_sensor.min_hold_s", 3600)) * 1000;
             else if (trimmed.find("dark_mv:") != std::string::npos)
                 cfg.light_sensor.dark_mv = static_cast<int>(parse_u32_config(val, "light_sensor.dark_mv", 3300));
             else if (trimmed.find("bright_mv:") != std::string::npos)
