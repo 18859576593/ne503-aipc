@@ -243,41 +243,12 @@ static void select_product_media_config_for_infrared(DaemonConfig& config) {
     config.media_config_path = kProductMediaConfig;
 }
 
-/* Lens product model is baked at pack time into product.yaml; the only
- * key consumed here is lens.model. Returns "" when the file is absent or
- * carries no lens model. */
-static std::string parse_product_lens_model(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return "";
-
-    std::string line;
-    bool in_lens_section = false;
-    while (std::getline(file, line)) {
-        line = strip_inline_comment(line);
-        const std::string trimmed = trim(line);
-        if (trimmed.empty() || trimmed[0] == '#') continue;
-
-        const bool indented = (line[0] == ' ' || line[0] == '\t');
-        if (trimmed.find("lens:") == 0 && !indented) {
-            in_lens_section = true;
-            continue;
-        }
-        if (!indented) {
-            in_lens_section = false;  // any other top-level key ends the section
-            continue;
-        }
-        if (in_lens_section && config_key_is(trimmed, "model"))
-            return get_value(trimmed);
-    }
-    return "";
-}
-
 /* Lens model from the factory EEPROM (CTFB v1): the HWREV identity field is
- * factory-station burned with "AF0832" or "FG2009" — this is the authoritative
- * source for the lens branch; new units are no longer baked with a lens model
- * in product.yaml. Returns "af0832"/"fg2009", or "" when the EEPROM carries no
- * recognized model (unprogrammed, no valid slot, HAL library unavailable) so
- * the caller can fall back to the legacy product.yaml value. */
+ * factory-station burned with "AF0832" or "FG2009" — the single source for
+ * the lens branch (product.yaml is no longer consulted). Returns
+ * "af0832"/"fg2009", or "" when the EEPROM carries no recognized model
+ * (unprogrammed, no valid slot, HAL library unavailable) so the caller
+ * defaults to af0832. */
 static std::string read_eeprom_lens_model(const DaemonConfig& config) {
     const std::string& lib_path = config.video_lib;
     if (lib_path.empty()) {
@@ -310,66 +281,43 @@ static std::string read_eeprom_lens_model(const DaemonConfig& config) {
                     model = v;
                 } else if (!v.empty()) {
                     HAL_LOG_WARNING("Lens model: factory EEPROM HWREV '%s' is not a "
-                                    "lens model; falling back to product.yaml",
+                                    "lens model; defaulting to af0832",
                                     v.c_str());
                 } else {
                     HAL_LOG_INFO("Lens model: factory EEPROM present but HWREV "
-                                 "unprogrammed; using product.yaml");
+                                 "unprogrammed; defaulting to af0832");
                 }
             } else {
                 HAL_LOG_INFO("Lens model: factory EEPROM read failed (ret=%d); "
-                             "using product.yaml", ret);
+                             "defaulting to af0832", ret);
             }
         } else {
             HAL_LOG_INFO("Lens model: factory EEPROM init failed (no at24 node?); "
-                         "using product.yaml");
+                         "defaulting to af0832");
         }
     } else {
-        HAL_LOG_INFO("Lens model: '%s' exports no HAL_FACTORY_OPS; using product.yaml",
+        HAL_LOG_INFO("Lens model: '%s' exports no HAL_FACTORY_OPS; defaulting to af0832",
                      lib_path.c_str());
     }
     dlclose(handle);
     return model;
 }
 
-/* Applies the lens model identity: factory EEPROM first (authoritative,
- * burned at the factory station), product.yaml lens.model as the legacy
- * fallback for pre-EEPROM units. Neither present keeps the af0832 default;
- * an unknown yaml value still fails fast so a mis-built image cannot drive
- * the wrong lens geometry. */
-static bool apply_lens_model_identity(DaemonConfig& config,
-                                      const std::string& config_path) {
-    const std::string product_path =
-        derive_install_prefix(config_path) + "/etc/product.yaml";
-    const std::string yaml_model = parse_product_lens_model(product_path);
+/* Applies the lens model identity: the factory EEPROM HWREV field (burned at
+ * the factory station) is the single source; product.yaml is no longer
+ * consulted. When the EEPROM carries no recognized model the daemon defaults
+ * to af0832 rather than failing, so an unprogrammed unit still boots. */
+static void apply_lens_model_identity(DaemonConfig& config) {
     const std::string eeprom_model = read_eeprom_lens_model(config);
 
     if (!eeprom_model.empty()) {
-        if (!yaml_model.empty() && yaml_model != eeprom_model) {
-            HAL_LOG_WARNING("Lens model mismatch: factory EEPROM '%s' vs product.yaml "
-                            "'%s' — EEPROM wins",
-                            eeprom_model.c_str(), yaml_model.c_str());
-        }
         config.lens_model = eeprom_model;
         HAL_LOG_INFO("Lens product model: %s (from factory EEPROM HWREV)",
                      eeprom_model.c_str());
-        return true;
+        return;
     }
-
-    if (yaml_model.empty()) {
-        HAL_LOG_WARNING("No lens model in factory EEPROM or '%s'; defaulting to af0832",
-                        product_path.c_str());
-        return true;
-    }
-    if (yaml_model != "af0832" && yaml_model != "fg2009") {
-        HAL_LOG_ERROR("Unknown lens model '%s' in %s (expected af0832|fg2009)",
-                      yaml_model.c_str(), product_path.c_str());
-        return false;
-    }
-    config.lens_model = yaml_model;
-    HAL_LOG_INFO("Lens product model: %s (legacy %s)",
-                 yaml_model.c_str(), product_path.c_str());
-    return true;
+    config.lens_model = "af0832";
+    HAL_LOG_INFO("Lens product model: af0832 (factory EEPROM carries no lens model)");
 }
 
 /* Per-lens IR profile: both lens versions share one media config, but each
@@ -1007,9 +955,7 @@ int main(int argc, char** argv) {
     setup_logging(config.log_level, config.log_file, config_path);
     // Lens model first: the IR profile name substitution below must happen
     // before the media-config validation resolves the effective name.
-    if (!apply_lens_model_identity(config, config_path)) {
-        return 1;
-    }
+    apply_lens_model_identity(config);
     apply_lens_infrared_profile(config);
     select_product_media_config_for_infrared(config);
 
