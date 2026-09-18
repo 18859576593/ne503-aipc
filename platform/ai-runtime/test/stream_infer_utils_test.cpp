@@ -278,16 +278,61 @@ void test_unlimited_gate() {
     assert(gate.allow(now));
 }
 
-void test_positive_gate_has_no_burst_credit() {
+void test_ratio_gate_banks_no_credit_without_elapsed_time() {
     using namespace std::chrono_literals;
 
     FrameRateGate gate(10);
     const auto start = FrameRateGate::TimePoint{};
+    assert(gate.allow(start));          // first frame passes
+    assert(!gate.allow(start));         // zero elapsed: no free credit
+    assert(!gate.allow(start + 99ms));  // under one interval banked so far
+    assert(gate.allow(start + 150ms));  // 1.5 intervals banked
+}
+
+void test_ratio_gate_converges_to_cap_on_indivisible_source() {
+    using namespace std::chrono_literals;
+
+    // 15fps source capped at 10: the old hard ceiling locked to the
+    // every-other-frame subharmonic (7.5fps). The credit bucket must
+    // deliver ~10/s — 30 ±1 allows over 45 arrivals (3s).
+    FrameRateGate gate(10);
+    const auto step = std::chrono::nanoseconds(66666667ns);  // 15fps
+    auto t = FrameRateGate::TimePoint{};
+    int allowed = 0;
+    for (int i = 0; i < 45; ++i, t += step) {
+        if (gate.allow(t)) ++allowed;
+    }
+    assert(allowed >= 29 && allowed <= 31);
+}
+
+void test_ratio_gate_tracks_source_when_cap_equals_rate() {
+    using namespace std::chrono_literals;
+
+    // cap == source rate used to be the worst corner (boundary flipping
+    // delivered 63%). With accrual == spend per arrival every frame passes.
+    FrameRateGate gate(15);
+    const auto step = std::chrono::nanoseconds(66666667ns);  // == gate interval
+    auto t = FrameRateGate::TimePoint{};
+    int allowed = 0;
+    for (int i = 0; i < 45; ++i, t += step) {
+        if (gate.allow(t)) ++allowed;
+    }
+    assert(allowed == 45);
+}
+
+void test_ratio_gate_catchup_after_stall_is_bounded() {
+    using namespace std::chrono_literals;
+
+    // A 2s stall banks at most kMaxCredits=2 entitlements: four consecutive
+    // source-spaced allows, then the gate re-engages.
+    FrameRateGate gate(10);
+    const auto start = FrameRateGate::TimePoint{};
     assert(gate.allow(start));
-    assert(!gate.allow(start + 99ms));
-    assert(gate.allow(start + 150ms));
-    assert(!gate.allow(start + 200ms));
-    assert(gate.allow(start + 250ms));
+    assert(gate.allow(start + 2000ms));
+    assert(gate.allow(start + 2066ms));
+    assert(gate.allow(start + 2133ms));
+    assert(gate.allow(start + 2200ms));
+    assert(!gate.allow(start + 2267ms));
 }
 
 void test_result_filters() {
@@ -567,7 +612,10 @@ int main() {
     test_nv12_binding_rejects_undersized_planes();
     test_nv12_binding_rejects_total_byte_overflow();
     test_unlimited_gate();
-    test_positive_gate_has_no_burst_credit();
+    test_ratio_gate_banks_no_credit_without_elapsed_time();
+    test_ratio_gate_converges_to_cap_on_indivisible_source();
+    test_ratio_gate_tracks_source_when_cap_equals_rate();
+    test_ratio_gate_catchup_after_stall_is_bounded();
     test_stream_rpc_admission_limits_and_release();
     test_zero_admission_limits_are_unbounded();
     test_stream_work_admission_limits_and_release();
