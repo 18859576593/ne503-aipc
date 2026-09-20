@@ -494,16 +494,21 @@ public:
     // required. Both helpers live under #ifdef HAS_GRPC (same as the OSD/privacy
     // helpers); the persist call site inside set_transform_config carries its own
     // #ifdef guard.
-    // Returns false on serialize/write/rename failure so the caller can
-    // withhold the lens-hint stamp (mirror and hint must advance together);
-    // a failure never aborts the already-applied HAL transform.
-    bool persist_transform_config(const aipc::camera::TransformConfig& req);
-    // load_transform_config: read the mirror at startup; returns false on
-    // missing (INFO) or unparseable (WARNING + Clear) — never aborts init.
-    // An all-identity file still returns true: the media pipeline seeds image
-    // settings from the profile iq_settings (dewarp defaults to enabled), so
-    // the identity state must be replayed to actually hold.
-    bool load_transform_config(aipc::camera::TransformConfig* req);
+    // Persist the transform config WITH the lens it was written for in ONE
+    // atomic file (v2 wrapper {"lens_model", "transform"}), so transform and
+    // lens attribution can never be observed split. Returns false on
+    // serialize/write/rename failure so the caller knows nothing durable
+    // landed; a failure never aborts the already-applied HAL transform.
+    bool persist_transform_config(const aipc::camera::TransformConfig& req,
+                                  const std::string& lens_model);
+    // load_transform_config: read the mirror at startup; *lens_model receives
+    // the embedded v2 lens attribution ("" for v1/legacy mirrors → the caller
+    // falls back to the sidecar hint). Returns false on missing (INFO) or
+    // unparseable (WARNING + Clear) — never aborts init. An all-identity
+    // config still returns true: the media pipeline seeds image settings from
+    // the profile iq_settings (dewarp defaults to enabled), so the identity
+    // state must be replayed to actually hold.
+    bool load_transform_config(aipc::camera::TransformConfig* req, std::string* lens_model);
 
     // Scalar config-field persistence — best-effort disk mirror of the last
     // web-configured scalar profile knobs (frontend.hailort.use-hailort-service and
