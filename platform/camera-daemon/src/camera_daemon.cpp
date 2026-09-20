@@ -24,6 +24,7 @@
 #include "../include/lens_hal_service.h"
 #include "../include/lens_image_probe.h"
 #include "camera.pb.h"
+#include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 #endif
 
@@ -93,6 +94,13 @@ constexpr const char* kPrivacyMaskConfigPath = "/data/aipc/etc/privacy_mask.json
 // runtime transform overrides. Hardcoded (KISS) to match the C++ side's
 // /data/aipc/etc default-root convention.
 constexpr const char* kTransformConfigPath = "/data/aipc/etc/transform_config.json";
+
+// Sidecar recording the lens model the persisted transform was last written
+// for — LEGACY v1 fallback only. Current writes embed the lens model inside
+// the transform mirror itself (one atomic file); this sidecar is consulted
+// just for mirrors written before that format existed, and a lens swap
+// (identity != probed model) re-seeds the optics-dependent dewarp default.
+constexpr const char* kTransformLensHintPath = "/data/aipc/etc/transform_lens_hint.txt";
 
 // Scalar config-field persistence mirror. Same convention as the transform/OSD/
 // privacy/ISP mirrors: /data/aipc/etc is the persistent p3 root and a .json
@@ -310,6 +318,30 @@ bool runtime_stream_reconfiguration_enabled() {
              std::strcmp(value, "no") == 0);
 }
 
+/* Lens-keyed dewarp default. The only distortion calibration on the rootfs is
+ * the Hailo SDK reference fisheye table (135.7 deg diagonal FOV): close enough
+ * to the fg2009 motorized zoom (~120 deg) to be worth enabling, but a gross
+ * over-correction for the narrow-FOV af0832 (~43 deg). Seed dewarp from the
+ * probed lens model; every other transform field keeps its persisted value. */
+bool lens_dewarp_default(const std::string& lens_model) {
+    return lens_model == "fg2009";
+}
+
+/* Lens hint sidecar (legacy v1): one plain-text line. Missing/corrupt reads
+ * as "unknown", which makes the next boot re-seed — the safe direction. */
+bool load_transform_lens_hint(std::string* lens_model) {
+    std::ifstream in(kTransformLensHintPath);
+    if (!in.is_open()) return false;
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    if (line.empty()) return false;
+    *lens_model = line;
+    return true;
+}
+
 }  // namespace
 
 CameraDaemon::CameraDaemon() = default;
@@ -357,21 +389,66 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     }
     // Reapply persisted transform (rotation/flip/dewarp/grayscale/dis/eis).
     // init_media() ran above so media_ctx_ is live and set_transform_config can
-    // apply immediately. On miss/corrupt/identity load_transform_config returns
-    // false and we start from the YAML defaults. Re-applying re-persists
-    // (idempotent, one cheap startup write) — same shape as the OSD/privacy
-    // replays above. NOTE: dewarp replay only re-enables the dewarp image field;
-    // the MEDIALIB_DEWARP_DSP_OPTIMIZATION env (kept at 0, the sp805-watchdog-
-    // safe setting) is a separate process env, not touched here.
+    // apply immediately. Re-applying re-persists (idempotent, one cheap startup
+    // write) — same shape as the OSD/privacy replays above. NOTE: dewarp replay
+    // only re-enables the dewarp image field; the MEDIALIB_DEWARP_DSP_OPTIMIZATION
+    // env (kept at 0, the sp805-watchdog-safe setting) is a separate process
+    // env, not touched here.
+    // Dewarp is optics-dependent: if the persisted transform was written for a
+    // different lens, re-seed dewarp from the probed lens model before
+    // replaying. The mirror embeds the lens it was written for (v2, one atomic
+    // file); legacy v1 mirrors fall back to the sidecar hint. Manual toggles
+    // persist the current lens alongside the transform, so they survive reboots
+    // until the lens hardware changes.
+    // The replay runs unconditionally: init_media() seeded the pipeline from
+    // the PROFILE iq_settings (dewarp defaults to enabled there), so skipping
+    // the apply would leave the profile default standing instead of the
+    // persisted/seeded state.
+    // With no valid mirror (missing/corrupt), seed the request from the LIVE
+    // media config and override only dewarp — replaying a zero proto would
+    // also wipe profile-set rotation/flip/grayscale/dis/eis on first boot. A
+    // missing mirror also re-seeds: the profile-seeded dewarp is not a
+    // deliberate choice for this lens.
     {
         aipc::camera::TransformConfig persisted;
-        if (load_transform_config(&persisted)) {
-            HAL_LOG_INFO("CameraDaemon: applying persisted transform config (rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d)",
-                         (int)persisted.rotation(), (int)persisted.flip(),
-                         persisted.dewarp() ? 1 : 0, persisted.grayscale() ? 1 : 0,
-                         persisted.dis() ? 1 : 0, persisted.eis() ? 1 : 0);
-            set_transform_config(persisted);
+        std::string mirror_lens;  // lens embedded in a v2 mirror; "" = v1/none
+        const bool mirrored = load_transform_config(&persisted, &mirror_lens);
+        if (!mirrored && !get_transform_config(persisted)) {
+            HAL_LOG_WARNING("CameraDaemon: no transform mirror and live config read "
+                            "failed; replaying lens-seeded defaults only");
         }
+        std::string written_for;
+        bool written_for_ok = false;
+        if (mirrored && !mirror_lens.empty()) {
+            written_for = mirror_lens;
+            written_for_ok = true;
+        } else {
+            std::string hint;
+            if (load_transform_lens_hint(&hint)) {
+                written_for = hint;
+                written_for_ok = true;
+            }
+        }
+        if (!mirrored || !written_for_ok || written_for != config_.lens_model) {
+            const bool want = lens_dewarp_default(config_.lens_model);
+            if (persisted.dewarp() != want) {
+                HAL_LOG_INFO("CameraDaemon: lens %s (transform last written for %s): "
+                             "re-seeding dewarp=%d",
+                             config_.lens_model.c_str(),
+                             written_for_ok ? written_for.c_str() : "<none>", want ? 1 : 0);
+                persisted.set_dewarp(want);
+            }
+        }
+        HAL_LOG_INFO("CameraDaemon: applying %s transform config (rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d)",
+                     mirrored ? "persisted" : "live-seeded",
+                     (int)persisted.rotation(), (int)persisted.flip(),
+                     persisted.dewarp() ? 1 : 0, persisted.grayscale() ? 1 : 0,
+                     persisted.dis() ? 1 : 0, persisted.eis() ? 1 : 0);
+        // No separate lens stamp exists: the apply persists the transform AND
+        // the current lens in one atomic mirror write, and a failure leaves
+        // the previous mirror+identity standing so the next boot retries the
+        // re-seed.
+        set_transform_config(persisted);
     }
     // Reapply persisted scalar config fields (replay-on-boot: platform mirror
     // wins over HAL profile defaults, resolving the two-writer ambiguity — HAL's
@@ -878,7 +955,12 @@ bool CameraDaemon::get_transform_config(aipc::camera::TransformConfig& config) {
     return true;
 }
 
-bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& config) {
+bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& config,
+                                        bool* persisted_ok) {
+    // Out-param starts false so every early-return path below reads as "not
+    // durably persisted"; only the applied+mirrored tail sets it true.
+    if (persisted_ok) *persisted_ok = false;
+
     // Serialize the full transform (light override OR full medialib reinit +
     // post-rebuild consumer restart + frame verify). A rotation may run a
     // blocking HAL reconfigure with op_mu_ released below; without this guard a
@@ -999,13 +1081,26 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
     last_image_config_ = ic;
     have_last_image_config_ = true;
 
-    // Persist the applied transform so it survives restart/deploy/OS-upgrade.
-    // Best-effort: a failure logs but never aborts the (already-applied) apply.
-    // set_transform_config is compiled unconditionally, but the persist helper
-    // (and the proto/json_util headers it needs) live under HAS_GRPC, so the
-    // call is guarded to match (same pattern as persist_privacy_mask_config).
+    // Persist the applied transform WITH the lens it was written for — one
+    // atomic tmp+rename file, so a reader can never observe a transform whose
+    // lens attribution is missing or stale (the split state the old two-file
+    // sidecar design allowed). A write failure logs but never aborts the
+    // (already-applied) HAL apply; it only reports persisted_ok=false so init
+    // retries the lens re-seed on the next boot. set_transform_config is
+    // compiled unconditionally, but the persist helper (and the proto/
+    // json_util headers it needs) live under HAS_GRPC, so the call is guarded
+    // to match (same pattern as persist_privacy_mask_config).
 #ifdef HAS_GRPC
-    persist_transform_config(config);
+    const bool mirrored = persist_transform_config(config, config_.lens_model);
+    if (!mirrored) {
+        HAL_LOG_WARNING("CameraDaemon: transform mirror write failed; lens "
+                        "re-seed retries next boot");
+    }
+    if (persisted_ok) *persisted_ok = mirrored;
+#else
+    // No persistence layer in this build: the applied state is the durable
+    // state, nothing is pending.
+    if (persisted_ok) *persisted_ok = true;
 #endif
 
     if (full_reinit) {
@@ -2982,10 +3077,14 @@ bool CameraDaemon::load_privacy_mask_config(aipc::camera::PrivacyMaskConfig* req
     return true;
 }
 
-// Persist the transform config (rotation/flip/dewarp/grayscale/dis/eis) to the
-// side-file atomically (tmp + rename). Best-effort: a serialize/write/rename
-// failure logs but never aborts the (already-applied) HAL apply in the caller.
-void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig& req) {
+// Persist the transform config together with the lens identity it was written
+// for — ONE atomic side-file (tmp + rename): {"lens_model": "…",
+// "transform": {…}}. Readers can therefore never observe a transform whose
+// lens attribution is missing or stale. Returns false on serialize/write/
+// rename failure so the caller knows nothing durable landed; a failure never
+// aborts the already-applied HAL transform.
+bool CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig& req,
+                                            const std::string& lens_model) {
     google::protobuf::util::JsonPrintOptions opts;
     opts.add_whitespace = true;
     opts.always_print_primitive_fields = true;
@@ -2994,7 +3093,27 @@ void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
     if (!st.ok()) {
         HAL_LOG_ERROR("CameraDaemon: persist transform: serialize failed: %s",
                       std::string(st.message()).c_str());
-        return;
+        return false;
+    }
+    google::protobuf::Struct nested;
+    st = google::protobuf::util::JsonStringToMessage(json, &nested);
+    if (!st.ok()) {
+        HAL_LOG_ERROR("CameraDaemon: persist transform: reparse failed: %s",
+                      std::string(st.message()).c_str());
+        return false;
+    }
+    google::protobuf::Struct wrapper;
+    (*wrapper.mutable_fields())["lens_model"].set_string_value(lens_model);
+    *(*wrapper.mutable_fields())["transform"].mutable_struct_value() = std::move(nested);
+    // NOTE: MessageToJsonString APPENDS to the output string — |json| still
+    // holds the bare-transform text from the serialize above, so the wrapper
+    // must go to a fresh string or the file ends up with both documents.
+    std::string wrapper_json;
+    st = google::protobuf::util::MessageToJsonString(wrapper, &wrapper_json, opts);
+    if (!st.ok()) {
+        HAL_LOG_ERROR("CameraDaemon: persist transform: wrapper serialize failed: %s",
+                      std::string(st.message()).c_str());
+        return false;
     }
 
     const std::string tmp = std::string(kTransformConfigPath) + ".tmp";
@@ -3002,14 +3121,14 @@ void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
         std::ofstream out(tmp, std::ios::out | std::ios::trunc);
         if (!out.is_open()) {
             HAL_LOG_ERROR("CameraDaemon: persist transform: open(%s) failed", tmp.c_str());
-            return;
+            return false;
         }
-        out << json;
+        out << wrapper_json;
         out.flush();
         if (!out.good()) {
             HAL_LOG_ERROR("CameraDaemon: persist transform: write(%s) failed", tmp.c_str());
             ::unlink(tmp.c_str());
-            return;
+            return false;
         }
     }  // ofstream flushed + closed here
 
@@ -3017,18 +3136,19 @@ void CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
         HAL_LOG_ERROR("CameraDaemon: persist transform: rename(%s -> %s) failed",
                       tmp.c_str(), kTransformConfigPath);
         ::unlink(tmp.c_str());
-        return;
+        return false;
     }
+    return true;
 }
 
-// Read the transform mirror at startup. Returns false on missing file (first
-// boot / never configured — INFO, not an error), unparseable JSON (WARNING +
-// Clear — a corrupt file never aborts init), or an identity config (rotation==0
-// && flip==0 && !dewarp && !grayscale && !dis && !eis — nothing to reapply, and
-// re-pushing identity would issue a needless dynamic_change_image_config call).
-// Never aborts init; the caller (init, under HAS_GRPC) proceeds with YAML
-// defaults.
-bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req) {
+// Read the transform mirror at startup. v2 mirrors embed the lens the
+// transform was written for; *lens_model receives it (empty for v1/legacy).
+// Returns false on missing file (first boot / never configured — INFO, not an
+// error) or unparseable JSON (WARNING + Clear — a corrupt file never aborts
+// init); the caller then seeds from the live media config instead of a zero
+// proto. Never aborts init.
+bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req,
+                                         std::string* lens_model) {
     std::ifstream in(kTransformConfigPath);
     if (!in.is_open()) {
         HAL_LOG_INFO("CameraDaemon: no persisted transform config (%s); starting clean",
@@ -3039,18 +3159,58 @@ bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req) {
     ss << in.rdbuf();
     in.close();
 
-    req->Clear();
-    auto st = google::protobuf::util::JsonStringToMessage(ss.str(), req);
+    lens_model->clear();
+    google::protobuf::Struct doc;
+    auto st = google::protobuf::util::JsonStringToMessage(ss.str(), &doc);
     if (!st.ok()) {
         HAL_LOG_WARNING("CameraDaemon: persisted transform config unparseable: %s; starting clean",
                         std::string(st.message()).c_str());
         req->Clear();
         return false;
     }
-    if (req->rotation() == 0 && req->flip() == 0 &&
-        !req->dewarp() && !req->grayscale() && !req->dis() && !req->eis()) {
-        return false;  // identity == nothing to reapply
+
+    // Re-serialize the chosen sub-object to JSON and parse it into the
+    // message (Struct has no direct message conversion).
+    const auto parse_from = [&](const google::protobuf::Struct& s) -> bool {
+        std::string json;
+        return google::protobuf::util::MessageToJsonString(s, &json).ok()
+            && google::protobuf::util::JsonStringToMessage(json, req).ok();
+    };
+
+    const auto& fields = doc.fields();
+    const auto transform_it = fields.find("transform");
+    if (transform_it != fields.end()
+        && transform_it->second.kind_case() == google::protobuf::Value::kStructValue) {
+        // v2 wrapper: lens attribution lives next to the transform, atomically.
+        const auto lens_it = fields.find("lens_model");
+        if (lens_it != fields.end()
+            && lens_it->second.kind_case() == google::protobuf::Value::kStringValue) {
+            *lens_model = lens_it->second.string_value();
+        }
+        if (!parse_from(transform_it->second.struct_value())) {
+            HAL_LOG_WARNING("CameraDaemon: persisted transform config (v2) unparseable; "
+                            "starting clean");
+            req->Clear();
+            lens_model->clear();
+            return false;
+        }
+        return true;
     }
+
+    // v1 legacy: the document is the bare transform; the caller falls back to
+    // the sidecar hint for lens attribution (first successful write upgrades
+    // the mirror to v2).
+    if (!parse_from(doc)) {
+        HAL_LOG_WARNING("CameraDaemon: persisted transform config (v1) unparseable: %s; "
+                        "starting clean");
+        req->Clear();
+        return false;
+    }
+    // NOTE: an all-identity config still counts as "have". The media pipeline
+    // seeds image settings from the PROFILE iq_settings (bundled profiles
+    // default dewarp to enabled), so treating identity as "nothing to reapply"
+    // silently reverts dewarp to the profile default on every boot — exactly
+    // what the persisted all-off state exists to override.
     return true;
 }
 
