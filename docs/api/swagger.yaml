@@ -7542,6 +7542,26 @@ components:
           $ref: '#/components/schemas/LensLimit'
         focus_limit:
           $ref: '#/components/schemas/LensLimit'
+        lens_model:
+          type: string
+          description: 'Factory-fitted lens identity: "af0832" | "fg2009" (empty on old camera-daemon backends)'
+        zoom_ratio:
+          type: number
+          description: Current optical zoom ratio (fg2009 position model, AF0832 ratio table)
+        zoom_ratio_range:
+          type: object
+          description: Optical zoom ratio bounds for the factory-fitted lens
+          properties:
+            min:
+              type: number
+            max:
+              type: number
+        fixed_lens:
+          type: boolean
+          description: >-
+            Image-probe verdict (~40s after boot or a lens swap): this lens
+            has no motors. Motor RPCs are gated with HAL_ERR_NOT_SUPPORTED
+            and UIs hide lens motor controls.
     AutofocusStatus:
       type: object
       properties:

@@ -442,6 +442,9 @@ public:
         resp->set_focus_rz_done(raw.focus_rz_done != 0);
         resp->set_zoom_pos(raw.zoom_pos);
         resp->set_focus_pos(raw.focus_pos);
+        // Fixed-lens identity (set by the image probe ~40s after boot) rides
+        // along every state poll so consumers can hide motor controls.
+        resp->set_fixed_lens(fixed_lens_.load());
 
         if (fg2009_) {
             // MCU position counters carry no optical meaning on FG2009;
