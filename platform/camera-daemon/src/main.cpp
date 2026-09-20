@@ -415,13 +415,24 @@ static std::string probe_lens_model(const DaemonConfig& config) {
                     target = static_cast<int>(a0b) - 400;
                     if (target < 0) target = 0;
                 }
-                iris_target_set(1, target);
-                iris_run(1, 0, 0);
-                iris_perturbed = true;
-                usleep(1200 * 1000);  // iris mechanical settle
-                const int get_ret = read_adc(&a1);
+                /* A failed drive leaves the ADC untouched, which here would
+                 * read as "no iris" and misfile a real AF0832 as fg2009 —
+                 * and the probe outranks the EEPROM. Treat a command
+                 * failure as an inconclusive probe (result stays empty) and
+                 * let the identity chain fall back. */
+                bool drive_ok = false;
+                if (iris_target_set(1, target) == 0 && iris_run(1, 0, 0) == 0) {
+                    iris_perturbed = true;
+                    drive_ok = true;
+                } else {
+                    HAL_LOG_WARNING("Lens probe: iris drive command failed; falling back");
+                }
+                usleep(drive_ok ? 1200 * 1000 : 0);  // iris mechanical settle
+                const int get_ret = drive_ok ? read_adc(&a1) : -1;
                 iris_stop(1);
-                if (get_ret != 0) {
+                if (!drive_ok) {
+                    // skipped: drive failed, result stays empty
+                } else if (get_ret != 0) {
                     HAL_LOG_WARNING("Lens probe: iris ADC re-read failed; falling back");
                 } else {
                     const int moved = static_cast<int>(a1) > static_cast<int>(a0b)
@@ -475,13 +486,16 @@ static std::string probe_lens_model(const DaemonConfig& config) {
              * g_default_iris_config.iris_tgt). Skipped when the probe itself
              * decided fg2009 — no physical iris exists there to restore. */
             if (iris_perturbed && result != "fg2009") {
-                iris_target_set(1, 0);
-                iris_run(1, 0, 0);
-                usleep(1200 * 1000);  // settle at the default target
-                iris_stop(1);
-                uint16_t a2 = 0;
-                if (iris_adc_get(1, &a2) == 0) {
-                    HAL_LOG_INFO("Lens probe: iris restored to default target 0 (adc %u)", a2);
+                if (iris_target_set(1, 0) == 0 && iris_run(1, 0, 0) == 0) {
+                    usleep(1200 * 1000);  // settle at the default target
+                    iris_stop(1);
+                    uint16_t a2 = 0;
+                    if (iris_adc_get(1, &a2) == 0) {
+                        HAL_LOG_INFO("Lens probe: iris restored to default target 0 (adc %u)", a2);
+                    }
+                } else {
+                    HAL_LOG_WARNING("Lens probe: iris restore command failed; "
+                                    "iris left perturbed");
                 }
             }
         }
@@ -1033,7 +1047,7 @@ static DaemonConfig load_config(const std::string& path) {
                 // Matched before the fg2009 subsection branch: keys unique to
                 // this block must parse wherever they sit under lens:.
                 if (trimmed.find("image_probe_enabled:") != std::string::npos)
-                    cfg.lens_image_probe_enabled = (int)parse_u32_config(val, "lens.image_probe_enabled");
+                    cfg.lens_image_probe_enabled = (val == "true" || val == "1");
                 else if (trimmed.find("image_probe_steps:") != std::string::npos)
                     cfg.lens_image_probe_steps = (int)parse_u32_config(val, "lens.image_probe_steps");
                 else if (trimmed.find("image_probe_frames:") != std::string::npos)

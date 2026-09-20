@@ -782,6 +782,10 @@ private:
     void fg2009_restore_loop(ArchivedLensPosition pos);
     std::thread fg2009_restore_thread_;
     std::atomic<bool> fg2009_restore_stop_{true};
+    // True while the archived-position restore thread is between spawn and
+    // exit. The restore moves run outside any autofocus job, so the image
+    // probe waits on this flag before it starts measuring.
+    std::atomic<bool> fg2009_restore_active_{false};
 
     // Stage-2 lens identity: the iris probe files the no-iris group as
     // fg2009; this deferred probe separates a real motorized FG2009 from a

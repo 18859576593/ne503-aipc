@@ -1423,6 +1423,7 @@ private:
 
     /* Physical relative jog, clamped so the model stays inside travel. */
     int fg2009_zoom_rel_locked(uint32_t pps, int32_t steps) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.zoom_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t target = hal_lens_fg2009_clamp_zoom_curve(
@@ -1438,6 +1439,7 @@ private:
     }
 
     int fg2009_focus_rel_locked(uint32_t pps, int32_t steps) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.focus_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t target = hal_lens_fg2009_clamp_focus_curve(

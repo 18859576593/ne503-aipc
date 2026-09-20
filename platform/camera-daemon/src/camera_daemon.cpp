@@ -3683,6 +3683,12 @@ void CameraDaemon::lens_position_recorder_loop() {
 }
 
 void CameraDaemon::fg2009_restore_loop(const ArchivedLensPosition pos) {
+    // Clear the in-progress flag on every exit so the image probe knows the
+    // replay (or its fallback) is finished.
+    struct RestoreDone {
+        std::atomic<bool>& flag;
+        ~RestoreDone() { flag.store(false); }
+    } restore_done{fg2009_restore_active_};
     // Mirror AutofocusController::wait_lens_ready: the FG2009 lens parks
     // during Init (ram + park), so wait for initialized/anchored plus five
     // consecutive still-motor reads before replaying the archive. Same
@@ -3934,6 +3940,7 @@ void CameraDaemon::start_grpc_server() {
             // enqueue is then rejected as busy — or covers the case where
             // the zoom delta was zero and nothing fired).
             fg2009_restore_stop_ = false;
+            fg2009_restore_active_ = true;
             fg2009_restore_thread_ = std::thread(
                 &CameraDaemon::fg2009_restore_loop, this, lens_archive);
         }
@@ -3974,6 +3981,24 @@ void CameraDaemon::lens_image_probe_loop() {
     pc.luma_guard_ratio = config_.lens_image_probe_luma_guard_ratio;
     pc.stream_name = config_.autofocus.stream_name;
 
+    /* Serialize with the archived-position restore: its replay moves run
+     * outside any autofocus job (no busy flag, no operation lock), so a
+     * probe starting mid-restore would interleave focus commands with its
+     * measurement and could produce an invalid verdict or final position.
+     * The restore thread always terminates on its own (bounded readiness
+     * wait + bounded moves); the cap only guards future regressions. */
+    const auto restore_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::minutes(10);
+    while (fg2009_restore_active_.load()) {
+        if (lens_image_probe_stop_.load()) return;
+        if (std::chrono::steady_clock::now() >= restore_deadline) {
+            HAL_LOG_WARNING("CameraDaemon: lens image probe skipped "
+                            "(position restore still running)");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
     double return_dev = 1.0;
     const LensImageProbeResult result = run_lens_image_probe(
         hal_loader_->isp(), video_source_->video_ctx(), frame_router_.get(),
@@ -3986,7 +4011,7 @@ void CameraDaemon::lens_image_probe_loop() {
         // leave the identity decision out of the user's hands.
         lens_controller_->mark_fixed_lens();
     } else if (result == LensImageProbeResult::Motorized &&
-               return_dev > pc.flat_ratio && autofocus_controller_) {
+               return_dev > pc.return_ratio && autofocus_controller_) {
         // The probe proved the motor but its return jog left the focus
         // short of the baseline (open-loop hysteresis). Refine once so the
         // shipped image is as sharp as before the probe touched the lens.
