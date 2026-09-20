@@ -94,6 +94,12 @@ constexpr const char* kPrivacyMaskConfigPath = "/data/aipc/etc/privacy_mask.json
 // /data/aipc/etc default-root convention.
 constexpr const char* kTransformConfigPath = "/data/aipc/etc/transform_config.json";
 
+// Sidecar recording the lens model the persisted transform was last written
+// for. A lens swap (hint != probed model) re-seeds the optics-dependent dewarp
+// default; manual toggles stamp the current lens via set_transform_config so
+// they survive reboots until the hardware changes again.
+constexpr const char* kTransformLensHintPath = "/data/aipc/etc/transform_lens_hint.txt";
+
 // Scalar config-field persistence mirror. Same convention as the transform/OSD/
 // privacy/ISP mirrors: /data/aipc/etc is the persistent p3 root and a .json
 // suffix is NOT clobbered by deploy.sh (which only rewrites etc/*.yaml), so
@@ -310,6 +316,47 @@ bool runtime_stream_reconfiguration_enabled() {
              std::strcmp(value, "no") == 0);
 }
 
+/* Lens-keyed dewarp default. The only distortion calibration on the rootfs is
+ * the Hailo SDK reference fisheye table (135.7 deg diagonal FOV): close enough
+ * to the fg2009 motorized zoom (~120 deg) to be worth enabling, but a gross
+ * over-correction for the narrow-FOV af0832 (~43 deg). Seed dewarp from the
+ * probed lens model; every other transform field keeps its persisted value. */
+bool lens_dewarp_default(const std::string& lens_model) {
+    return lens_model == "fg2009";
+}
+
+/* Lens hint sidecar: one plain-text line. Missing/corrupt reads as "unknown",
+ * which makes the next boot re-seed — the safe direction. */
+bool load_transform_lens_hint(std::string* lens_model) {
+    std::ifstream in(kTransformLensHintPath);
+    if (!in.is_open()) return false;
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    if (line.empty()) return false;
+    *lens_model = line;
+    return true;
+}
+
+void persist_transform_lens_hint(const std::string& lens_model) {
+    const std::string tmp = std::string(kTransformLensHintPath) + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::out | std::ios::trunc);
+        if (!out.is_open()) {
+            HAL_LOG_WARNING("CameraDaemon: lens hint: open(%s) failed", tmp.c_str());
+            return;
+        }
+        out << lens_model << "\n";
+    }  // ofstream flushed + closed here
+    if (std::rename(tmp.c_str(), kTransformLensHintPath) != 0) {
+        HAL_LOG_WARNING("CameraDaemon: lens hint: rename(%s -> %s) failed",
+                        tmp.c_str(), kTransformLensHintPath);
+        ::unlink(tmp.c_str());
+    }
+}
+
 }  // namespace
 
 CameraDaemon::CameraDaemon() = default;
@@ -357,21 +404,43 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     }
     // Reapply persisted transform (rotation/flip/dewarp/grayscale/dis/eis).
     // init_media() ran above so media_ctx_ is live and set_transform_config can
-    // apply immediately. On miss/corrupt/identity load_transform_config returns
-    // false and we start from the YAML defaults. Re-applying re-persists
-    // (idempotent, one cheap startup write) — same shape as the OSD/privacy
-    // replays above. NOTE: dewarp replay only re-enables the dewarp image field;
-    // the MEDIALIB_DEWARP_DSP_OPTIMIZATION env (kept at 0, the sp805-watchdog-
-    // safe setting) is a separate process env, not touched here.
+    // apply immediately. On miss/corrupt load_transform_config returns false
+    // (persisted stays zeroed) and the lens-seeded defaults below still get
+    // enforced. Re-applying re-persists (idempotent, one cheap startup write) —
+    // same shape as the OSD/privacy replays above. NOTE: dewarp replay only
+    // re-enables the dewarp image field; the MEDIALIB_DEWARP_DSP_OPTIMIZATION
+    // env (kept at 0, the sp805-watchdog-safe setting) is a separate process
+    // env, not touched here.
+    // Dewarp is optics-dependent: if the persisted transform was written for a
+    // different lens (or the hint is missing — first boot after this upgrade),
+    // re-seed dewarp from the probed lens model before replaying. Toggles made
+    // from the API/web stamp the hint in set_transform_config, so they survive
+    // reboots until the lens hardware changes.
+    // The replay runs unconditionally: init_media() seeded the pipeline from
+    // the PROFILE iq_settings (dewarp defaults to enabled there), so skipping
+    // the apply would leave the profile default standing instead of the
+    // persisted/seeded state.
     {
         aipc::camera::TransformConfig persisted;
-        if (load_transform_config(&persisted)) {
-            HAL_LOG_INFO("CameraDaemon: applying persisted transform config (rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d)",
-                         (int)persisted.rotation(), (int)persisted.flip(),
-                         persisted.dewarp() ? 1 : 0, persisted.grayscale() ? 1 : 0,
-                         persisted.dis() ? 1 : 0, persisted.eis() ? 1 : 0);
-            set_transform_config(persisted);
+        const bool have = load_transform_config(&persisted);
+        std::string hint;
+        const bool hint_ok = load_transform_lens_hint(&hint);
+        if (!hint_ok || hint != config_.lens_model) {
+            const bool want = lens_dewarp_default(config_.lens_model);
+            if ((!have && want) || (have && persisted.dewarp() != want)) {
+                HAL_LOG_INFO("CameraDaemon: lens %s (transform last written for %s): "
+                             "re-seeding dewarp=%d",
+                             config_.lens_model.c_str(),
+                             hint_ok ? hint.c_str() : "<none>", want ? 1 : 0);
+                persisted.set_dewarp(want);
+            }
         }
+        persist_transform_lens_hint(config_.lens_model);
+        HAL_LOG_INFO("CameraDaemon: applying persisted transform config (rot=%d flip=%d dewarp=%d gray=%d dis=%d eis=%d)",
+                     (int)persisted.rotation(), (int)persisted.flip(),
+                     persisted.dewarp() ? 1 : 0, persisted.grayscale() ? 1 : 0,
+                     persisted.dis() ? 1 : 0, persisted.eis() ? 1 : 0);
+        set_transform_config(persisted);
     }
     // Reapply persisted scalar config fields (replay-on-boot: platform mirror
     // wins over HAL profile defaults, resolving the two-writer ambiguity — HAL's
@@ -1006,6 +1075,10 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
     // call is guarded to match (same pattern as persist_privacy_mask_config).
 #ifdef HAS_GRPC
     persist_transform_config(config);
+    // Stamp the lens this transform was written for, so a manual API/web toggle
+    // counts as a deliberate choice for the CURRENT lens and survives reboots
+    // (a later lens swap re-seeds dewarp in init's transform replay).
+    persist_transform_lens_hint(config_.lens_model);
 #endif
 
     if (full_reinit) {
@@ -3047,10 +3120,11 @@ bool CameraDaemon::load_transform_config(aipc::camera::TransformConfig* req) {
         req->Clear();
         return false;
     }
-    if (req->rotation() == 0 && req->flip() == 0 &&
-        !req->dewarp() && !req->grayscale() && !req->dis() && !req->eis()) {
-        return false;  // identity == nothing to reapply
-    }
+    // NOTE: an all-identity file still counts as "have". The media pipeline
+    // seeds image settings from the PROFILE iq_settings (bundled profiles
+    // default dewarp to enabled), so treating identity as "nothing to reapply"
+    // silently reverts dewarp to the profile default on every boot — exactly
+    // what the persisted all-off state exists to override.
     return true;
 }
 

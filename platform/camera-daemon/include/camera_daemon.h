@@ -490,8 +490,10 @@ public:
     // #ifdef guard.
     void persist_transform_config(const aipc::camera::TransformConfig& req);
     // load_transform_config: read the mirror at startup; returns false on
-    // missing (INFO), unparseable (WARNING + Clear), or identity (all fields at
-    // their defaults — nothing to reapply) — never aborts init.
+    // missing (INFO) or unparseable (WARNING + Clear) — never aborts init.
+    // An all-identity file still returns true: the media pipeline seeds image
+    // settings from the profile iq_settings (dewarp defaults to enabled), so
+    // the identity state must be replayed to actually hold.
     bool load_transform_config(aipc::camera::TransformConfig* req);
 
     // Scalar config-field persistence — best-effort disk mirror of the last
