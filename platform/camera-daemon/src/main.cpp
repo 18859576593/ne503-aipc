@@ -32,6 +32,7 @@
 extern "C" {
     #include "hal_log.h"
     #include "crash_handler.h"
+    #include "peripheral/devices/hal_lens.h"
 }
 
 static CameraDaemon* g_daemon = nullptr;
@@ -303,12 +304,229 @@ static std::string read_eeprom_lens_model(const DaemonConfig& config) {
     return model;
 }
 
-/* Applies the lens model identity: the factory EEPROM HWREV field (burned at
- * the factory station) is the single source; product.yaml is no longer
- * consulted. When the EEPROM carries no recognized model the daemon defaults
- * to af0832 rather than failing, so an unprogrammed unit still boots. */
+/* Adaptive lens probe (differential iris test). AF0832 carries a physical
+ * iris driven by a Hall closed loop; FG2009 has none — iris register writes
+ * still succeed (the driver chip is shared), but the ADC reading cannot move.
+ * Drive the iris to a target far from the current reading and re-read:
+ * movement toward the target = af0832, no movement = fg2009. Runs before the
+ * lens service owns the UART: opens the lens bridge, probes, tears the
+ * session down (the service re-initializes the MCU afterwards, same as a
+ * daemon restart). Returns "af0832"/"fg2009", or "" when the probe could not
+ * run (no bridge, MCU not answering, ambiguous movement) so the caller falls
+ * back to the factory EEPROM. */
+static std::string probe_lens_model(const DaemonConfig& config) {
+    const std::string& lib_path = config.lens_bridge_lib;
+    if (lib_path.empty()) {
+        HAL_LOG_INFO("Lens probe: no lens bridge configured; skipped");
+        return "";
+    }
+    void* handle = dlopen(lib_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        HAL_LOG_INFO("Lens probe: cannot load '%s' (%s)", lib_path.c_str(), dlerror());
+        return "";
+    }
+    using IoInitFn = int (*)(const char*, uint32_t, uint32_t);
+    using HandleFn = int (*)(int);
+    using ModeFn = int (*)(int, int);
+    using RunFn = int (*)(int, int, int);
+    using AdcFn = int (*)(int, void*);
+    using ProfileSetFn = int (*)(int, uint32_t);
+    using StateGetFn = int (*)(int, HalLensState*);
+    IoInitFn io_init = nullptr;
+    HandleFn io_deinit = nullptr, lens_init = nullptr, lens_deinit = nullptr,
+             iris_stop = nullptr;
+    ModeFn lens_config = nullptr;
+    RunFn iris_run = nullptr;
+    ModeFn iris_target_set = nullptr;  // (handle, target)
+    AdcFn iris_adc_get = nullptr;
+    ProfileSetFn profile_set = nullptr;   // optional: MCU 0.1.8+ only
+    HandleFn zoom_rz = nullptr;           // optional: PI end-stop probe
+    StateGetFn state_get = nullptr;       // optional: zoom_rz_done polling
+    *reinterpret_cast<void**>(&io_init) = dlsym(handle, "hal_bridge_io_init");
+    *reinterpret_cast<void**>(&io_deinit) = dlsym(handle, "hal_bridge_io_deinit");
+    *reinterpret_cast<void**>(&lens_init) = dlsym(handle, "hal_bridge_lens_init");
+    *reinterpret_cast<void**>(&lens_deinit) = dlsym(handle, "hal_bridge_lens_deinit");
+    *reinterpret_cast<void**>(&lens_config) = dlsym(handle, "hal_bridge_lens_config");
+    *reinterpret_cast<void**>(&iris_run) = dlsym(handle, "hal_bridge_iris_run");
+    *reinterpret_cast<void**>(&iris_stop) = dlsym(handle, "hal_bridge_iris_stop");
+    *reinterpret_cast<void**>(&iris_target_set) = dlsym(handle, "hal_bridge_iris_target_set");
+    *reinterpret_cast<void**>(&iris_adc_get) = dlsym(handle, "hal_bridge_iris_adc_get");
+    *reinterpret_cast<void**>(&profile_set) = dlsym(handle, "hal_bridge_profile_set");
+    *reinterpret_cast<void**>(&zoom_rz) = dlsym(handle, "hal_bridge_zoom_rz");
+    *reinterpret_cast<void**>(&state_get) = dlsym(handle, "hal_bridge_lens_state_get");
+    if (!io_init || !io_deinit || !lens_init || !lens_deinit || !lens_config ||
+        !iris_run || !iris_stop || !iris_target_set || !iris_adc_get) {
+        HAL_LOG_INFO("Lens probe: '%s' missing lens/iris symbols; skipped", lib_path.c_str());
+        dlclose(handle);
+        return "";
+    }
+
+    std::string result;
+    if (io_init(config.lens_serial_device.c_str(),
+                config.lens_baud_rate, config.lens_timeout_ms) == 0) {
+        int ret = lens_init(1);
+        if (ret != 0) {  // same retry shape as the lens service Init RPC
+            lens_deinit(1);
+            usleep(100 * 1000);
+            ret = lens_init(1);
+        }
+        const int cfg_ret = ret == 0 ? lens_config(1, 0) : ret;
+        if (cfg_ret != 0) {
+            HAL_LOG_WARNING("Lens probe: MCU session failed (init=%d cfg=%d); falling back",
+                            ret, cfg_ret);
+        } else {
+            /* MCU 0.1.8 gates iris ops by the active lens profile; a sticky
+             * FG2009 profile from a previous session vetoes the probe with
+             * NOT_SUPPORTED. Force AF0832 (iris ungated) for the probe — the
+             * lens service re-pushes the final profile during Init. Firmware
+             * without PROFILE_SET (0.1.7) replies an error, which is fine:
+             * it never gates iris either. */
+            if (profile_set) {
+                const int pset = profile_set(1, 0 /* HAL_LENS_MODEL_AF0832 */);
+                if (pset != 0) {
+                    HAL_LOG_INFO("Lens probe: profile_set(af0832) ret=%d (pre-0.1.8 MCU; ignored)",
+                                 pset);
+                }
+            }
+            usleep(200 * 1000);  // let the MCU finish applying the config
+            /* First read after boot can race the MCU's own init; retry. */
+            auto read_adc = [&](uint16_t* out) -> int {
+                for (int attempt = 1; attempt <= 3; ++attempt) {
+                    const int ret = iris_adc_get(1, out);
+                    if (ret == 0) return 0;
+                    HAL_LOG_WARNING("Lens probe: iris ADC read attempt %d failed (ret=%d)",
+                                    attempt, ret);
+                    usleep(250 * 1000);
+                }
+                return -1;
+            };
+            uint16_t a0 = 0, a0b = 0, a1 = 0;
+            bool iris_perturbed = false;
+            if (read_adc(&a0) != 0 || read_adc(&a0b) != 0) {
+                HAL_LOG_WARNING("Lens probe: iris ADC unreadable; falling back");
+            } else {
+                /* Target far from the current reading so a converged iris
+                 * cannot already sit on it (10-bit ADC scale). */
+                int target;
+                if (a0 < 512) {
+                    target = static_cast<int>(a0b) + 400;
+                    if (target > 1023) target = 1023;
+                } else {
+                    target = static_cast<int>(a0b) - 400;
+                    if (target < 0) target = 0;
+                }
+                /* A failed drive leaves the ADC untouched, which here would
+                 * read as "no iris" and misfile a real AF0832 as fg2009 —
+                 * and the probe outranks the EEPROM. Treat a command
+                 * failure as an inconclusive probe (result stays empty) and
+                 * let the identity chain fall back. */
+                bool drive_ok = false;
+                if (iris_target_set(1, target) == 0 && iris_run(1, 0, 0) == 0) {
+                    iris_perturbed = true;
+                    drive_ok = true;
+                } else {
+                    HAL_LOG_WARNING("Lens probe: iris drive command failed; falling back");
+                }
+                usleep(drive_ok ? 1200 * 1000 : 0);  // iris mechanical settle
+                const int get_ret = drive_ok ? read_adc(&a1) : -1;
+                iris_stop(1);
+                if (!drive_ok) {
+                    // skipped: drive failed, result stays empty
+                } else if (get_ret != 0) {
+                    HAL_LOG_WARNING("Lens probe: iris ADC re-read failed; falling back");
+                } else {
+                    const int moved = static_cast<int>(a1) > static_cast<int>(a0b)
+                                          ? static_cast<int>(a1) - static_cast<int>(a0b)
+                                          : static_cast<int>(a0b) - static_cast<int>(a1);
+                    const int d_new = static_cast<int>(a1) > target
+                                          ? static_cast<int>(a1) - target
+                                          : target - static_cast<int>(a1);
+                    const int d_old = static_cast<int>(a0b) > target
+                                          ? static_cast<int>(a0b) - target
+                                          : target - static_cast<int>(a0b);
+                    HAL_LOG_INFO("Lens probe: iris adc %u->%u (target %d, moved %d%s)",
+                                 a0b, a1, target, moved, a0 != a0b ? ", base noisy" : "");
+                    if (moved >= 40 && d_new < d_old) {
+                        result = "af0832";
+                    } else if (moved < 40) {
+                        result = "fg2009";
+                    } else if (zoom_rz && state_get) {
+                        /* Auxiliary PI probe for the ambiguous middle ground.
+                         * AF0832 has the zoom photo-interrupter, so reset-zero
+                         * completes (zoom_rz_done sets); FG2009 has none, the
+                         * MCU motor times out (~5s) and done never sets. Still
+                         * under the forced AF0832 profile, so 0.1.8 firmware
+                         * does not gate the command. */
+                        HalLensState st0{};
+                        if (state_get(1, &st0) == 0 && st0.zoom_rz_done) {
+                            result = "af0832";  // homed earlier => PI fired once
+                            HAL_LOG_INFO("Lens probe: PI probe skipped (already homed) -> af0832");
+                        } else if (zoom_rz(1) == 0) {
+                            HAL_LOG_INFO("Lens probe: iris ambiguous; running zoom reset-zero (PI) probe");
+                            for (int waited_ms = 0; waited_ms < 7000; waited_ms += 300) {
+                                usleep(300 * 1000);
+                                HalLensState st{};
+                                if (state_get(1, &st) == 0 && st.zoom_rz_done) {
+                                    result = "af0832";
+                                    break;
+                                }
+                            }
+                            if (result.empty()) result = "fg2009";
+                            HAL_LOG_INFO("Lens probe: PI probe -> %s", result.c_str());
+                        } else {
+                            HAL_LOG_WARNING("Lens probe: ambiguous movement, zoom RZ start failed; falling back");
+                        }
+                    } else {
+                        HAL_LOG_WARNING("Lens probe: ambiguous movement; falling back");
+                    }
+                }
+            }
+            /* Restore the AF0832 default iris: the probe chased a far target,
+             * so drive the physical iris back to the system default (target 0,
+             * g_default_iris_config.iris_tgt). Skipped when the probe itself
+             * decided fg2009 — no physical iris exists there to restore. */
+            if (iris_perturbed && result != "fg2009") {
+                if (iris_target_set(1, 0) == 0 && iris_run(1, 0, 0) == 0) {
+                    usleep(1200 * 1000);  // settle at the default target
+                    iris_stop(1);
+                    uint16_t a2 = 0;
+                    if (iris_adc_get(1, &a2) == 0) {
+                        HAL_LOG_INFO("Lens probe: iris restored to default target 0 (adc %u)", a2);
+                    }
+                } else {
+                    HAL_LOG_WARNING("Lens probe: iris restore command failed; "
+                                    "iris left perturbed");
+                }
+            }
+        }
+        lens_deinit(1);
+        io_deinit(1);
+    } else {
+        HAL_LOG_WARNING("Lens probe: io_init on %s failed; falling back",
+                        config.lens_serial_device.c_str());
+    }
+    dlclose(handle);
+    return result;
+}
+
+/* Applies the lens model identity: the adaptive iris probe decides first;
+ * the factory EEPROM HWREV field (burned at the factory station) is the
+ * fallback when the probe cannot run; af0832 is the last-resort default so
+ * an unprogrammed unit still boots. A probe/EEPROM conflict warns and the
+ * probe wins. */
 static void apply_lens_model_identity(DaemonConfig& config) {
+    const std::string probed = probe_lens_model(config);
     const std::string eeprom_model = read_eeprom_lens_model(config);
+    if (!probed.empty()) {
+        if (!eeprom_model.empty() && eeprom_model != probed) {
+            HAL_LOG_WARNING("Lens model conflict: probe '%s' vs factory EEPROM '%s' "
+                            "— probe wins",
+                            probed.c_str(), eeprom_model.c_str());
+        }
+        config.lens_model = probed;
+        HAL_LOG_INFO("Lens product model: %s (adaptive iris probe)", probed.c_str());
+        return;
+    }
 
     if (!eeprom_model.empty()) {
         config.lens_model = eeprom_model;
@@ -317,7 +535,7 @@ static void apply_lens_model_identity(DaemonConfig& config) {
         return;
     }
     config.lens_model = "af0832";
-    HAL_LOG_INFO("Lens product model: af0832 (factory EEPROM carries no lens model)");
+    HAL_LOG_INFO("Lens product model: af0832 (probe and EEPROM carry no lens model)");
 }
 
 /* Per-lens IR profile: both lens versions share one media config, but each
@@ -822,6 +1040,36 @@ static DaemonConfig load_config(const std::string& path) {
         } else if (section == "lens") {
             if (trimmed.find("fg2009:") == 0) {
                 lens_subsection = "fg2009";
+            } else if (trimmed.find("position_persistence:") != std::string::npos) {
+                cfg.lens_position_persistence = (val == "true" || val == "1");
+            } else if (trimmed.find("image_probe_") != std::string::npos) {
+                // lens: image_probe_* keys (image-sharpness fixed-lens probe).
+                // Matched before the fg2009 subsection branch: keys unique to
+                // this block must parse wherever they sit under lens:.
+                if (trimmed.find("image_probe_enabled:") != std::string::npos)
+                    cfg.lens_image_probe_enabled = (val == "true" || val == "1");
+                else if (trimmed.find("image_probe_steps:") != std::string::npos)
+                    cfg.lens_image_probe_steps = (int)parse_u32_config(val, "lens.image_probe_steps");
+                else if (trimmed.find("image_probe_frames:") != std::string::npos)
+                    cfg.lens_image_probe_frames = (int)parse_u32_config(val, "lens.image_probe_frames");
+                else if (trimmed.find("image_probe_settle_ms:") != std::string::npos)
+                    cfg.lens_image_probe_settle_ms = (int)parse_u32_config(val, "lens.image_probe_settle_ms");
+                else if (trimmed.find("image_probe_pps:") != std::string::npos)
+                    cfg.lens_image_probe_pps = (int)parse_u32_config(val, "lens.image_probe_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("image_probe_ready_timeout_ms:") != std::string::npos)
+                    cfg.lens_image_probe_ready_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_ready_timeout_ms");
+                else if (trimmed.find("image_probe_move_timeout_ms:") != std::string::npos)
+                    cfg.lens_image_probe_move_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_move_timeout_ms");
+                else if (trimmed.find("image_probe_texture_floor:") != std::string::npos)
+                    cfg.lens_image_probe_texture_floor = parse_u32_config(val, "lens.image_probe_texture_floor");
+                else if (trimmed.find("image_probe_motor_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_motor_ratio = parse_float_config(val, "lens.image_probe_motor_ratio");
+                else if (trimmed.find("image_probe_flat_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_flat_ratio = parse_float_config(val, "lens.image_probe_flat_ratio");
+                else if (trimmed.find("image_probe_return_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_return_ratio = parse_float_config(val, "lens.image_probe_return_ratio");
+                else if (trimmed.find("image_probe_luma_guard_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_luma_guard_ratio = parse_float_config(val, "lens.image_probe_luma_guard_ratio");
             } else if (lens_subsection == "fg2009") {
                 if (trimmed.find("ram_steps:") != std::string::npos)
                     cfg.lens_fg2009.ram_steps = (int32_t)parse_u32_config(val, "lens.fg2009.ram_steps");
@@ -855,8 +1103,6 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009_af_move_timeout_ms = (int)parse_u32_config(val, "lens.fg2009.af_move_timeout_ms");
                 else if (trimmed.find("focus_curve_path:") != std::string::npos)
                     cfg.lens_fg2009_focus_curve_path = val;
-            } else if (trimmed.find("position_persistence:") != std::string::npos) {
-                cfg.lens_position_persistence = (val == "true" || val == "1");
             }
         }
     }
