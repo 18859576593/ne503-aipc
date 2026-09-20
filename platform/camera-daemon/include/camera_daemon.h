@@ -367,8 +367,14 @@ public:
 
     /**
      * @brief Update transform configuration via HAL_MEDIA_OPS
+     *
+     * @param persisted_ok  optional out: true only when the applied config was
+     *   also durably mirrored (HAS_GRPC builds). False on every apply failure
+     *   and on a mirror-write failure — init uses this to decide whether the
+     *   lens hint may advance (avoiding a hint/mirror split-brain).
      */
-    bool set_transform_config(const aipc::camera::TransformConfig& config);
+    bool set_transform_config(const aipc::camera::TransformConfig& config,
+                              bool* persisted_ok = nullptr);
 
     /**
      * @brief Set a single scalar profile field at runtime (platform-owned config knob).
@@ -488,7 +494,10 @@ public:
     // required. Both helpers live under #ifdef HAS_GRPC (same as the OSD/privacy
     // helpers); the persist call site inside set_transform_config carries its own
     // #ifdef guard.
-    void persist_transform_config(const aipc::camera::TransformConfig& req);
+    // Returns false on serialize/write/rename failure so the caller can
+    // withhold the lens-hint stamp (mirror and hint must advance together);
+    // a failure never aborts the already-applied HAL transform.
+    bool persist_transform_config(const aipc::camera::TransformConfig& req);
     // load_transform_config: read the mirror at startup; returns false on
     // missing (INFO) or unparseable (WARNING + Clear) — never aborts init.
     // An all-identity file still returns true: the media pipeline seeds image
