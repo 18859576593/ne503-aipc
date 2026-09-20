@@ -502,8 +502,8 @@ static std::string probe_lens_model(const DaemonConfig& config) {
  * probe wins. */
 static void apply_lens_model_identity(DaemonConfig& config) {
     const std::string probed = probe_lens_model(config);
+    const std::string eeprom_model = read_eeprom_lens_model(config);
     if (!probed.empty()) {
-        const std::string eeprom_model = read_eeprom_lens_model(config);
         if (!eeprom_model.empty() && eeprom_model != probed) {
             HAL_LOG_WARNING("Lens model conflict: probe '%s' vs factory EEPROM '%s' "
                             "— probe wins",
@@ -513,7 +513,6 @@ static void apply_lens_model_identity(DaemonConfig& config) {
         HAL_LOG_INFO("Lens product model: %s (adaptive iris probe)", probed.c_str());
         return;
     }
-    const std::string eeprom_model = read_eeprom_lens_model(config);
 
     if (!eeprom_model.empty()) {
         config.lens_model = eeprom_model;
@@ -1027,6 +1026,36 @@ static DaemonConfig load_config(const std::string& path) {
         } else if (section == "lens") {
             if (trimmed.find("fg2009:") == 0) {
                 lens_subsection = "fg2009";
+            } else if (trimmed.find("position_persistence:") != std::string::npos) {
+                cfg.lens_position_persistence = (val == "true" || val == "1");
+            } else if (trimmed.find("image_probe_") != std::string::npos) {
+                // lens: image_probe_* keys (image-sharpness fixed-lens probe).
+                // Matched before the fg2009 subsection branch: keys unique to
+                // this block must parse wherever they sit under lens:.
+                if (trimmed.find("image_probe_enabled:") != std::string::npos)
+                    cfg.lens_image_probe_enabled = (int)parse_u32_config(val, "lens.image_probe_enabled");
+                else if (trimmed.find("image_probe_steps:") != std::string::npos)
+                    cfg.lens_image_probe_steps = (int)parse_u32_config(val, "lens.image_probe_steps");
+                else if (trimmed.find("image_probe_frames:") != std::string::npos)
+                    cfg.lens_image_probe_frames = (int)parse_u32_config(val, "lens.image_probe_frames");
+                else if (trimmed.find("image_probe_settle_ms:") != std::string::npos)
+                    cfg.lens_image_probe_settle_ms = (int)parse_u32_config(val, "lens.image_probe_settle_ms");
+                else if (trimmed.find("image_probe_pps:") != std::string::npos)
+                    cfg.lens_image_probe_pps = (int)parse_u32_config(val, "lens.image_probe_pps", HAL_LENS_FG2009_MAX_PPS);
+                else if (trimmed.find("image_probe_ready_timeout_ms:") != std::string::npos)
+                    cfg.lens_image_probe_ready_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_ready_timeout_ms");
+                else if (trimmed.find("image_probe_move_timeout_ms:") != std::string::npos)
+                    cfg.lens_image_probe_move_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_move_timeout_ms");
+                else if (trimmed.find("image_probe_texture_floor:") != std::string::npos)
+                    cfg.lens_image_probe_texture_floor = parse_u32_config(val, "lens.image_probe_texture_floor");
+                else if (trimmed.find("image_probe_motor_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_motor_ratio = parse_float_config(val, "lens.image_probe_motor_ratio");
+                else if (trimmed.find("image_probe_flat_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_flat_ratio = parse_float_config(val, "lens.image_probe_flat_ratio");
+                else if (trimmed.find("image_probe_return_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_return_ratio = parse_float_config(val, "lens.image_probe_return_ratio");
+                else if (trimmed.find("image_probe_luma_guard_ratio:") != std::string::npos)
+                    cfg.lens_image_probe_luma_guard_ratio = parse_float_config(val, "lens.image_probe_luma_guard_ratio");
             } else if (lens_subsection == "fg2009") {
                 if (trimmed.find("ram_steps:") != std::string::npos)
                     cfg.lens_fg2009.ram_steps = (int32_t)parse_u32_config(val, "lens.fg2009.ram_steps");
@@ -1060,8 +1089,6 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_fg2009_af_move_timeout_ms = (int)parse_u32_config(val, "lens.fg2009.af_move_timeout_ms");
                 else if (trimmed.find("focus_curve_path:") != std::string::npos)
                     cfg.lens_fg2009_focus_curve_path = val;
-            } else if (trimmed.find("position_persistence:") != std::string::npos) {
-                cfg.lens_position_persistence = (val == "true" || val == "1");
             }
         }
     }

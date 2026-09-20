@@ -198,6 +198,7 @@ set(SOURCES
     src/dsp_service.cpp
     src/injection_service.cpp
     src/autofocus_controller.cpp
+    src/lens_image_probe.cpp
     src/illumination_controller.cpp
     src/daynight_policy.cpp
     src/camera_control_service.cpp

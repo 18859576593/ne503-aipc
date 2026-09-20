@@ -273,6 +273,25 @@ struct DaemonConfig {
     // curve (the job queues immediately and waits for the lens to park).
     int lens_fg2009_af_boot_oneshot = 1;
 
+    // Image-sharpness probe (motorized vs fixed lens): when the iris probe
+    // files the unit under the no-iris group, a short focus jog observed
+    // through the ISP AF statistics decides whether a focus motor answered
+    // (statistics dip and return) or nothing is attached (statistics flat on
+    // a textured scene). Runs deferred after the lens parks and the boot
+    // autofocus pass completes; bench-tunable via lens.image_probe.* keys.
+    int lens_image_probe_enabled = 1;
+    int lens_image_probe_steps = 250;       // focus jog, curve steps each way
+    int lens_image_probe_frames = 5;        // frames per measurement point
+    int lens_image_probe_settle_ms = 400;   // mechanical settle after a jog
+    int lens_image_probe_pps = 600;
+    int lens_image_probe_ready_timeout_ms = 120000;  // lens+AF+stats readiness
+    int lens_image_probe_move_timeout_ms = 15000;
+    uint32_t lens_image_probe_texture_floor = 3000;  // raw AF sum, bench-calibrated
+    float lens_image_probe_motor_ratio = 0.25f;  // dip depth that proves a motor
+    float lens_image_probe_flat_ratio = 0.08f;   // flat band (gate + stability)
+    float lens_image_probe_return_ratio = 0.15f; // return-to-baseline tolerance
+    float lens_image_probe_luma_guard_ratio = 0.20f; // AE-shift rejection band
+
     // Lens position persistence: archive the last user-settled zoom/focus
     // (event-driven — the recorder arms on issued motion and writes only
     // after the motors settle and the position actually changed) and replay
@@ -763,6 +782,16 @@ private:
     void fg2009_restore_loop(ArchivedLensPosition pos);
     std::thread fg2009_restore_thread_;
     std::atomic<bool> fg2009_restore_stop_{true};
+
+    // Stage-2 lens identity: the iris probe files the no-iris group as
+    // fg2009; this deferred probe separates a real motorized FG2009 from a
+    // fixed-focus lens (electrically identical) using the image sensor as
+    // the feedback channel. Runs once after the boot autofocus pass parks
+    // the lens; a FixedLens verdict marks the lens controller and every
+    // motor motion request is rejected from then on.
+    void lens_image_probe_loop();
+    std::thread lens_image_probe_thread_;
+    std::atomic<bool> lens_image_probe_stop_{true};
 #endif
 
     bool switch_profile_internal(const std::string& profile_name, bool restart_af,

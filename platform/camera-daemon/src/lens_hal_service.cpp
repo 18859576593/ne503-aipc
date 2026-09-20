@@ -102,6 +102,15 @@ public:
         return af_operation_active_.load();
     }
 
+    void mark_fixed_lens() override {
+        fixed_lens_.store(true);
+        HAL_LOG_WARNING("LensHAL: fixed-lens identity applied — motor motion rejected");
+    }
+
+    bool fixed_lens() const override {
+        return fixed_lens_.load();
+    }
+
     bool initialized() const override {
         std::lock_guard<std::mutex> lock(mu_);
         return initialized_;
@@ -141,6 +150,7 @@ public:
     }
 
     int zoom_abs_wait(int pps, int32_t position, uint32_t timeout_ms) override {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         int ret = HAL_ERR_NOT_INITIALIZED;
         bool event_waited = false;
         {
@@ -166,6 +176,7 @@ public:
     }
 
     int focus_abs_wait(int pps, int32_t position, uint32_t timeout_ms) override {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         int ret = HAL_ERR_NOT_INITIALIZED;
         bool event_waited = false;
         {
@@ -1025,6 +1036,7 @@ private:
     Config          cfg_;
     mutable std::mutex mu_;
     std::atomic<bool> af_operation_active_{false};
+    std::atomic<bool> fixed_lens_{false};
     void*           dl_handle_     = nullptr;
     BridgeSymbols   sym_{};
     bool            bridge_loaded_ = false;
@@ -1328,6 +1340,7 @@ private:
      * fold the completed move into the model. Fire-and-forget like the
      * AF0832-era ZoomAbs RPC; completion via WaitZoomStopped. */
     int fg2009_zoom_abs_locked(uint32_t pps, int32_t target_curve) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.zoom_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t delta =
@@ -1342,6 +1355,7 @@ private:
     }
 
     int fg2009_focus_abs_locked(uint32_t pps, int32_t target_curve) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.focus_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t delta =
@@ -1359,6 +1373,7 @@ private:
      * by ZoomGotoRatio so focus rides the INF tracking curve atomically. */
     int fg2009_dual_abs_locked(uint32_t zoom_pps, int32_t target_zoom,
                                uint32_t focus_pps, int32_t target_focus) {
+        if (fixed_lens_.load()) return HAL_ERR_NOT_SUPPORTED;
         if (!initialized_ || !fg2009_state_.anchored || !sym_.dual_rel)
             return HAL_ERR_NOT_INITIALIZED;
         const int32_t zdelta =

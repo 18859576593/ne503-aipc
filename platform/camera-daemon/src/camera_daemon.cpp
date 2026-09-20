@@ -22,6 +22,7 @@
 #ifdef HAS_GRPC
 #include "../include/camera_control_service.h"
 #include "../include/lens_hal_service.h"
+#include "../include/lens_image_probe.h"
 #include "camera.pb.h"
 #include <google/protobuf/util/json_util.h>
 #endif
@@ -3937,10 +3938,79 @@ void CameraDaemon::start_grpc_server() {
                 &CameraDaemon::fg2009_restore_loop, this, lens_archive);
         }
     }
+
+    // Stage-2 lens identity (image-sharpness probe): the iris probe filed
+    // this unit as fg2009, which is also what a motorless fixed lens looks
+    // like electrically. The probe jogs focus once after the boot autofocus
+    // pass parks the lens and lets the ISP statistics arbitrate. Identity
+    // is adaptive-only: even a factory EEPROM that stamps fg2009 does not
+    // short-circuit the probe — a fixed lens mis-stamped at the factory
+    // still gets caught here.
+    if (config_.lens_model == "fg2009" && !config_.lens_image_probe_enabled) {
+        HAL_LOG_INFO("CameraDaemon: lens image probe disabled by config");
+    } else if (config_.lens_model == "fg2009" && lens_controller_ &&
+               hal_loader_ && hal_loader_->has_isp() && video_source_ &&
+               frame_router_) {
+        HAL_LOG_INFO("CameraDaemon: lens image probe armed");
+        lens_image_probe_stop_ = false;
+        lens_image_probe_thread_ = std::thread(
+            &CameraDaemon::lens_image_probe_loop, this);
+    }
+}
+
+void CameraDaemon::lens_image_probe_loop() {
+    LensImageProbeConfig pc;
+    pc.steps = config_.lens_image_probe_steps;
+    pc.frames = config_.lens_image_probe_frames;
+    pc.settle_ms = config_.lens_image_probe_settle_ms;
+    pc.pps = config_.lens_image_probe_pps;
+    pc.ready_timeout_ms = config_.lens_image_probe_ready_timeout_ms;
+    pc.move_timeout_ms = config_.lens_image_probe_move_timeout_ms;
+    pc.frame_wait_timeout_ms = 900;
+    pc.texture_floor = config_.lens_image_probe_texture_floor;
+    pc.motor_ratio = config_.lens_image_probe_motor_ratio;
+    pc.flat_ratio = config_.lens_image_probe_flat_ratio;
+    pc.return_ratio = config_.lens_image_probe_return_ratio;
+    pc.luma_guard_ratio = config_.lens_image_probe_luma_guard_ratio;
+    pc.stream_name = config_.autofocus.stream_name;
+
+    double return_dev = 1.0;
+    const LensImageProbeResult result = run_lens_image_probe(
+        hal_loader_->isp(), video_source_->video_ctx(), frame_router_.get(),
+        lens_controller_, autofocus_controller_.get(), pc,
+        &lens_image_probe_stop_, &return_dev);
+    HAL_LOG_INFO("CameraDaemon: lens image probe verdict: %s",
+                 lens_image_probe_result_name(result));
+    if (result == LensImageProbeResult::FixedLens && lens_controller_) {
+        // Verified motorless: reject every motion request from now on and
+        // leave the identity decision out of the user's hands.
+        lens_controller_->mark_fixed_lens();
+    } else if (result == LensImageProbeResult::Motorized &&
+               return_dev > pc.flat_ratio && autofocus_controller_) {
+        // The probe proved the motor but its return jog left the focus
+        // short of the baseline (open-loop hysteresis). Refine once so the
+        // shipped image is as sharp as before the probe touched the lens.
+        uint64_t refine_job = 0;
+        std::string refine_error;
+        if (autofocus_controller_->start_one_shot(&refine_job, &refine_error)) {
+            HAL_LOG_INFO("CameraDaemon: post-probe focus refinement job %llu "
+                         "queued (return deviation %.1f%%)",
+                         (unsigned long long)refine_job, return_dev * 100.0);
+        } else {
+            HAL_LOG_WARNING("CameraDaemon: post-probe refinement rejected: %s",
+                            refine_error.c_str());
+        }
+    }
 }
 
 void CameraDaemon::stop_grpc_server() {
-    // Join the boot-restore thread first: it moves the lens and enqueues
+    // Join the image probe first: it moves the lens and samples ISP stats,
+    // both torn down below (lens service, AF controller, video pipeline).
+    if (lens_image_probe_thread_.joinable()) {
+        lens_image_probe_stop_ = true;
+        lens_image_probe_thread_.join();
+    }
+    // Join the boot-restore thread next: it moves the lens and enqueues
     // autofocus jobs, both of which are torn down right after.
     if (fg2009_restore_thread_.joinable()) {
         fg2009_restore_stop_ = true;
