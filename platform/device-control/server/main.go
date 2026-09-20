@@ -150,6 +150,7 @@ type lensStatusCache struct {
 	FocusLimitMax int32
 	ZoomRatio     float32
 	HasZoomRatio  bool
+	FixedLens     bool
 }
 
 func NewDeviceControlServer(cfg *Config, lensHal hal.LensHAL, cameraDaemonClient camerapb.CameraControlClient, cameraDaemonConn *grpc.ClientConn) *DeviceControlServer {
@@ -1309,6 +1310,9 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 				AutofocusEnabled: s.autofocusEnabled,
 				ZoomLimit:        &pb.LensLimit{MinPos: cached.ZoomLimitMin, MaxPos: cached.ZoomLimitMax},
 				FocusLimit:       &pb.LensLimit{MinPos: cached.FocusLimitMin, MaxPos: cached.FocusLimitMax},
+				// Keep the fixed-lens verdict across fallbacks so the web keeps
+				// hiding motor controls even when the lens HAL link drops.
+				FixedLens: cached.FixedLens,
 			}
 			fillLensIdentity(resp, cached.ZoomRatio, cached.HasZoomRatio)
 			return resp
@@ -1351,6 +1355,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		AutofocusEnabled: s.autofocusEnabled,
 		ZoomLimit:        &pb.LensLimit{MinPos: zlim.MinPos, MaxPos: zlim.MaxPos},
 		FocusLimit:       &pb.LensLimit{MinPos: flim.MinPos, MaxPos: flim.MaxPos},
+		FixedLens:        state.FixedLens,
 	}
 	fillLensIdentity(resp, zoomRatio, true)
 	s.lensStatusMu.Lock()
@@ -1368,6 +1373,7 @@ func (s *DeviceControlServer) GetLensStatus(ctx context.Context, req *pb.Empty) 
 		FocusLimitMax: resp.FocusLimit.GetMaxPos(),
 		ZoomRatio:     zoomRatio,
 		HasZoomRatio:  true,
+		FixedLens:     resp.FixedLens,
 	}
 	s.hasLensStatus = true
 	s.lensStatusMu.Unlock()
