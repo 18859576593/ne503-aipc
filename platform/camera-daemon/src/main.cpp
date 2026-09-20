@@ -32,6 +32,7 @@
 extern "C" {
     #include "hal_log.h"
     #include "crash_handler.h"
+    #include "peripheral/devices/hal_lens.h"
 }
 
 static CameraDaemon* g_daemon = nullptr;
@@ -330,6 +331,7 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     using RunFn = int (*)(int, int, int);
     using AdcFn = int (*)(int, void*);
     using ProfileSetFn = int (*)(int, uint32_t);
+    using StateGetFn = int (*)(int, HalLensState*);
     IoInitFn io_init = nullptr;
     HandleFn io_deinit = nullptr, lens_init = nullptr, lens_deinit = nullptr,
              iris_stop = nullptr;
@@ -337,7 +339,9 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     RunFn iris_run = nullptr;
     ModeFn iris_target_set = nullptr;  // (handle, target)
     AdcFn iris_adc_get = nullptr;
-    ProfileSetFn profile_set = nullptr;  // optional: MCU 0.1.8+ only
+    ProfileSetFn profile_set = nullptr;   // optional: MCU 0.1.8+ only
+    HandleFn zoom_rz = nullptr;           // optional: PI end-stop probe
+    StateGetFn state_get = nullptr;       // optional: zoom_rz_done polling
     *reinterpret_cast<void**>(&io_init) = dlsym(handle, "hal_bridge_io_init");
     *reinterpret_cast<void**>(&io_deinit) = dlsym(handle, "hal_bridge_io_deinit");
     *reinterpret_cast<void**>(&lens_init) = dlsym(handle, "hal_bridge_lens_init");
@@ -348,6 +352,8 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     *reinterpret_cast<void**>(&iris_target_set) = dlsym(handle, "hal_bridge_iris_target_set");
     *reinterpret_cast<void**>(&iris_adc_get) = dlsym(handle, "hal_bridge_iris_adc_get");
     *reinterpret_cast<void**>(&profile_set) = dlsym(handle, "hal_bridge_profile_set");
+    *reinterpret_cast<void**>(&zoom_rz) = dlsym(handle, "hal_bridge_zoom_rz");
+    *reinterpret_cast<void**>(&state_get) = dlsym(handle, "hal_bridge_lens_state_get");
     if (!io_init || !io_deinit || !lens_init || !lens_deinit || !lens_config ||
         !iris_run || !iris_stop || !iris_target_set || !iris_adc_get) {
         HAL_LOG_INFO("Lens probe: '%s' missing lens/iris symbols; skipped", lib_path.c_str());
@@ -395,6 +401,7 @@ static std::string probe_lens_model(const DaemonConfig& config) {
                 return -1;
             };
             uint16_t a0 = 0, a0b = 0, a1 = 0;
+            bool iris_perturbed = false;
             if (read_adc(&a0) != 0 || read_adc(&a0b) != 0) {
                 HAL_LOG_WARNING("Lens probe: iris ADC unreadable; falling back");
             } else {
@@ -410,10 +417,10 @@ static std::string probe_lens_model(const DaemonConfig& config) {
                 }
                 iris_target_set(1, target);
                 iris_run(1, 0, 0);
+                iris_perturbed = true;
                 usleep(1200 * 1000);  // iris mechanical settle
                 const int get_ret = read_adc(&a1);
                 iris_stop(1);
-                iris_target_set(1, a0b);  // restore pre-probe target (no-op w/o iris)
                 if (get_ret != 0) {
                     HAL_LOG_WARNING("Lens probe: iris ADC re-read failed; falling back");
                 } else {
@@ -432,9 +439,49 @@ static std::string probe_lens_model(const DaemonConfig& config) {
                         result = "af0832";
                     } else if (moved < 40) {
                         result = "fg2009";
+                    } else if (zoom_rz && state_get) {
+                        /* Auxiliary PI probe for the ambiguous middle ground.
+                         * AF0832 has the zoom photo-interrupter, so reset-zero
+                         * completes (zoom_rz_done sets); FG2009 has none, the
+                         * MCU motor times out (~5s) and done never sets. Still
+                         * under the forced AF0832 profile, so 0.1.8 firmware
+                         * does not gate the command. */
+                        HalLensState st0{};
+                        if (state_get(1, &st0) == 0 && st0.zoom_rz_done) {
+                            result = "af0832";  // homed earlier => PI fired once
+                            HAL_LOG_INFO("Lens probe: PI probe skipped (already homed) -> af0832");
+                        } else if (zoom_rz(1) == 0) {
+                            HAL_LOG_INFO("Lens probe: iris ambiguous; running zoom reset-zero (PI) probe");
+                            for (int waited_ms = 0; waited_ms < 7000; waited_ms += 300) {
+                                usleep(300 * 1000);
+                                HalLensState st{};
+                                if (state_get(1, &st) == 0 && st.zoom_rz_done) {
+                                    result = "af0832";
+                                    break;
+                                }
+                            }
+                            if (result.empty()) result = "fg2009";
+                            HAL_LOG_INFO("Lens probe: PI probe -> %s", result.c_str());
+                        } else {
+                            HAL_LOG_WARNING("Lens probe: ambiguous movement, zoom RZ start failed; falling back");
+                        }
                     } else {
                         HAL_LOG_WARNING("Lens probe: ambiguous movement; falling back");
                     }
+                }
+            }
+            /* Restore the AF0832 default iris: the probe chased a far target,
+             * so drive the physical iris back to the system default (target 0,
+             * g_default_iris_config.iris_tgt). Skipped when the probe itself
+             * decided fg2009 — no physical iris exists there to restore. */
+            if (iris_perturbed && result != "fg2009") {
+                iris_target_set(1, 0);
+                iris_run(1, 0, 0);
+                usleep(1200 * 1000);  // settle at the default target
+                iris_stop(1);
+                uint16_t a2 = 0;
+                if (iris_adc_get(1, &a2) == 0) {
+                    HAL_LOG_INFO("Lens probe: iris restored to default target 0 (adc %u)", a2);
                 }
             }
         }
