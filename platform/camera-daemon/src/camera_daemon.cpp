@@ -3105,7 +3105,11 @@ bool CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
     google::protobuf::Struct wrapper;
     (*wrapper.mutable_fields())["lens_model"].set_string_value(lens_model);
     *(*wrapper.mutable_fields())["transform"].mutable_struct_value() = std::move(nested);
-    st = google::protobuf::util::MessageToJsonString(wrapper, &json, opts);
+    // NOTE: MessageToJsonString APPENDS to the output string — |json| still
+    // holds the bare-transform text from the serialize above, so the wrapper
+    // must go to a fresh string or the file ends up with both documents.
+    std::string wrapper_json;
+    st = google::protobuf::util::MessageToJsonString(wrapper, &wrapper_json, opts);
     if (!st.ok()) {
         HAL_LOG_ERROR("CameraDaemon: persist transform: wrapper serialize failed: %s",
                       std::string(st.message()).c_str());
@@ -3119,7 +3123,7 @@ bool CameraDaemon::persist_transform_config(const aipc::camera::TransformConfig&
             HAL_LOG_ERROR("CameraDaemon: persist transform: open(%s) failed", tmp.c_str());
             return false;
         }
-        out << json;
+        out << wrapper_json;
         out.flush();
         if (!out.good()) {
             HAL_LOG_ERROR("CameraDaemon: persist transform: write(%s) failed", tmp.c_str());
