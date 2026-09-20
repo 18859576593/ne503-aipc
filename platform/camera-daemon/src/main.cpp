@@ -329,6 +329,7 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     using ModeFn = int (*)(int, int);
     using RunFn = int (*)(int, int, int);
     using AdcFn = int (*)(int, void*);
+    using ProfileSetFn = int (*)(int, uint32_t);
     IoInitFn io_init = nullptr;
     HandleFn io_deinit = nullptr, lens_init = nullptr, lens_deinit = nullptr,
              iris_stop = nullptr;
@@ -336,6 +337,7 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     RunFn iris_run = nullptr;
     ModeFn iris_target_set = nullptr;  // (handle, target)
     AdcFn iris_adc_get = nullptr;
+    ProfileSetFn profile_set = nullptr;  // optional: MCU 0.1.8+ only
     *reinterpret_cast<void**>(&io_init) = dlsym(handle, "hal_bridge_io_init");
     *reinterpret_cast<void**>(&io_deinit) = dlsym(handle, "hal_bridge_io_deinit");
     *reinterpret_cast<void**>(&lens_init) = dlsym(handle, "hal_bridge_lens_init");
@@ -345,6 +347,7 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     *reinterpret_cast<void**>(&iris_stop) = dlsym(handle, "hal_bridge_iris_stop");
     *reinterpret_cast<void**>(&iris_target_set) = dlsym(handle, "hal_bridge_iris_target_set");
     *reinterpret_cast<void**>(&iris_adc_get) = dlsym(handle, "hal_bridge_iris_adc_get");
+    *reinterpret_cast<void**>(&profile_set) = dlsym(handle, "hal_bridge_profile_set");
     if (!io_init || !io_deinit || !lens_init || !lens_deinit || !lens_config ||
         !iris_run || !iris_stop || !iris_target_set || !iris_adc_get) {
         HAL_LOG_INFO("Lens probe: '%s' missing lens/iris symbols; skipped", lib_path.c_str());
@@ -366,6 +369,19 @@ static std::string probe_lens_model(const DaemonConfig& config) {
             HAL_LOG_WARNING("Lens probe: MCU session failed (init=%d cfg=%d); falling back",
                             ret, cfg_ret);
         } else {
+            /* MCU 0.1.8 gates iris ops by the active lens profile; a sticky
+             * FG2009 profile from a previous session vetoes the probe with
+             * NOT_SUPPORTED. Force AF0832 (iris ungated) for the probe — the
+             * lens service re-pushes the final profile during Init. Firmware
+             * without PROFILE_SET (0.1.7) replies an error, which is fine:
+             * it never gates iris either. */
+            if (profile_set) {
+                const int pset = profile_set(1, 0 /* HAL_LENS_MODEL_AF0832 */);
+                if (pset != 0) {
+                    HAL_LOG_INFO("Lens probe: profile_set(af0832) ret=%d (pre-0.1.8 MCU; ignored)",
+                                 pset);
+                }
+            }
             usleep(200 * 1000);  // let the MCU finish applying the config
             /* First read after boot can race the MCU's own init; retry. */
             auto read_adc = [&](uint16_t* out) -> int {
