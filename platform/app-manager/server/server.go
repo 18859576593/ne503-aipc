@@ -3002,7 +3002,7 @@ func (s *AppManagerServer) extractImageModels(ctx context.Context, appID string,
 			continue
 		}
 		if reg.ModelType == "detection" {
-			if smokeErr := s.probeFreshRegistration(ctx, client, appID, p.id); smokeErr != nil {
+			if smokeErr := s.probeFreshRegistration(ctx, client, appID, p.id, reg.ModelType != ""); smokeErr != nil {
 				fail("postprocess smoke test failed (%v); registration rolled back", smokeErr)
 				// The registration is gone; drop the unpacked files too so a
 				// later PreloadModels cannot resurrect a known-broken model.
@@ -3289,7 +3289,7 @@ func (s *AppManagerServer) PreloadModels(ctx context.Context, appID string, appM
 			// only reinstall rewrites them), but a known-broken registration
 			// is not left behind for the app to infer against.
 			if !preexisting[modelID] && reg.ModelType == "detection" {
-				if err := s.probeFreshRegistration(ctx, client, appID, modelID); err != nil {
+				if err := s.probeFreshRegistration(ctx, client, appID, modelID, reg.ModelType != ""); err != nil {
 					recordFailure(modelID, fmt.Sprintf("restored bundled model %s for app %s failed its postprocess smoke test: %v", modelID, appID, err))
 				}
 			}
@@ -3342,23 +3342,25 @@ func (s *AppManagerServer) preloadPlatformModel(ctx context.Context, client infe
 	}
 	// The stored file stays (the platform row owns it); only this freshly
 	// created registration is rolled back on failure.
-	return s.probeFreshRegistration(ctx, client, appID, modelID)
+	return s.probeFreshRegistration(ctx, client, appID, modelID, grpcType != "")
 }
 
 // probeFreshRegistration smoke-tests a registration this app just created and
 // rolls it back on failure. A detection model whose postprocess profile does
 // not match its HEF registers fine but then fails every infer; probing one
 // frame right after RegisterModel catches the mismatch while the caller can
-// still undo the registration. Missing tensor info skips the probe (that is
-// RunLoadSmokeTest's contract). The smoke failure is returned so install-path
-// callers can route it into the install result; preload-path callers just
-// take the rollback and its Error log.
-func (s *AppManagerServer) probeFreshRegistration(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string) error {
+// still undo the registration. expectPostResult flows into RunLoadSmokeTest:
+// a registration that declared a postprocess model_type must produce a
+// structured post_result on the probe. Missing tensor info skips the probe
+// (that is RunLoadSmokeTest's contract). The smoke failure is returned so
+// install-path callers can route it into the install result; preload-path
+// callers just take the rollback and its Error log.
+func (s *AppManagerServer) probeFreshRegistration(ctx context.Context, client inferencepb.InferenceServiceClient, appID, modelID string, expectPostResult bool) error {
 	info, infoErr := client.GetModelInfo(ctx, &inferencepb.ModelInfo{ModelId: modelID})
 	if infoErr != nil {
 		info = nil // no tensor info: RunLoadSmokeTest skips the probe
 	}
-	if smokeErr := modelload.RunLoadSmokeTest(ctx, client, modelID, info); smokeErr != nil {
+	if smokeErr := modelload.RunLoadSmokeTest(ctx, client, modelID, info, expectPostResult); smokeErr != nil {
 		logger.Error("Load smoke test failed for freshly registered model %s (app %s); rolling back registration: %v", modelID, appID, smokeErr)
 		if _, unregErr := client.UnregisterModel(ctx, &inferencepb.ModelInfo{ModelId: modelID, OwnerId: appID}); unregErr != nil {
 			logger.Error("Failed to roll back registration of model %s for app %s: %v", modelID, appID, unregErr)

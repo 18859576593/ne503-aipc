@@ -367,3 +367,32 @@ func TestModelHealBackoffSchedule(t *testing.T) {
 		t.Error("reset must clear the window")
 	}
 }
+
+// A success-shaped probe response that carries no post_result means the
+// postprocess stage produced nothing (broken plugin / no session): the load
+// must fail and roll the registration back instead of leaving a model that
+// answers every inference with empty structured output.
+func TestLoadModelCoreSmokeRejectsMissingPostResult(t *testing.T) {
+	withTempConstantsRoot(t)
+	h, fake, store := newAIUpdateTestEnv(t)
+	blob := seedBlob(t, store, "h2")
+	fake.smokeSpec = &inferencepb.TensorSpec{Shape: []int32{1, 8, 8}, Dtype: inferencepb.DataType_UINT8}
+	fake.smokeDropPostResult = true
+	row := &model.AIModel{
+		ModelID: "smoke_nopost", Name: "smoke_nopost", Status: "uploaded", Source: "web",
+		ModelType: "detection", FilePath: blob, FileHash: "h2",
+	}
+	seedAIModel(t, h, row)
+
+	err := h.loadModelCore(context.Background(), selfHealClient(h), row)
+	if err == nil || !strings.Contains(err.Error(), "postprocess produced no result") {
+		t.Fatalf("want missing-post_result failure, got %v", err)
+	}
+	calls := loadCalls(t, fake)
+	if len(calls) != 2 || calls[0] != "load:smoke_nopost" || calls[1] != "unload:smoke_nopost" {
+		t.Fatalf("registration must be rolled back, got %v", calls)
+	}
+	if after, _ := h.aiModelRepo.GetByModelID("smoke_nopost"); after.Status != "uploaded" {
+		t.Errorf("row must stay uploaded, got %q", after.Status)
+	}
+}

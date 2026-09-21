@@ -470,7 +470,7 @@ func (tx *bundledModelTransaction) Publish(ctx context.Context) error {
 		tx.registered = append(tx.registered, req.ModelId)
 		failure := registerRequest(ctx, client, req)
 		if failure == nil && req.ModelType == "detection" {
-			failure = tx.s.probeFreshRegistration(ctx, client, tx.appID, req.ModelId)
+			failure = tx.s.probeFreshRegistration(ctx, client, tx.appID, req.ModelId, req.ModelType != "")
 		}
 		if failure == nil {
 			tx.succeeded++

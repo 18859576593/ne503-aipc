@@ -21,6 +21,7 @@
 
 #include "hal_ml_loader.h"
 #include "model_manager.h"
+#include "model_variant_validation.h"
 #include "session_manager.h"
 #include "inference_scheduler.h"
 #include "postprocess_pool.h"
@@ -369,6 +370,193 @@ void test_model_manager() {
     ASSERT_EQ(rc, 0, "unregister after release should succeed");
 
     ASSERT_TRUE(!mgr.acquire_model_snapshot("yolo_test").has_value(), "model should be gone");
+
+    PASS();
+}
+
+// ─── Mock postprocess ops whose create() always fails ────────────────────────
+// The observable contract of HAL's fail-loud change (Fix 1): a vendor plugin
+// that cannot be dlopened/dlsymed answers create() with nullptr instead of a
+// session whose every run() would silently fail.
+static HalPostprocessSession* mock_post_create_fail(const HalPostprocessConfig*) {
+    return nullptr;
+}
+static void mock_post_destroy(HalPostprocessSession*) {}
+static int mock_post_run_fail(HalPostprocessSession*, const HalTensor*, int,
+                              HalPostprocessResult*) {
+    return -1;
+}
+static void mock_post_free_result(HalPostprocessResult*) {}
+
+// ─── Test: postprocess create failure keeps the registration intact ──────────
+// ModelManager translates create()==nullptr into init_post_process failure
+// without touching the registration; rolling the registration back (Fix 2) is
+// the gRPC layer's decision, made with a readable status message.
+void test_postprocess_create_failure_keeps_model_registered() {
+    TEST(postprocess_create_failure_keeps_model_registered);
+
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    HalPostprocessOps post_ops{};
+    post_ops.create      = mock_post_create_fail;
+    post_ops.destroy     = mock_post_destroy;
+    post_ops.run         = mock_post_run_fail;
+    post_ops.free_result = mock_post_free_result;
+
+    ModelManager mgr(&infer_ops, &post_ops, nullptr, nullptr);
+    ASSERT_EQ(mgr.register_model("broken_pp", "/fake/broken.hef", "app-a"), 0,
+              "register_model failed");
+
+    int rc = mgr.init_post_process("broken_pp", "detection", "");
+    ASSERT_EQ(rc, -1, "init_post_process must fail when create() returns null");
+
+    // The registration itself survives; no postprocess session may exist.
+    auto snap = mgr.acquire_model_snapshot("broken_pp");
+    ASSERT_TRUE(snap.has_value(),
+                "model must stay registered after postprocess init failure");
+    ASSERT_TRUE(snap->post_session == nullptr, "no postprocess session may exist");
+    mgr.release_model("broken_pp");
+
+    ASSERT_EQ(mgr.unregister_model("broken_pp", "app-a"), 0, "cleanup unregister");
+
+    PASS();
+}
+
+// ─── Test: note_post_failure journal cadence (Fix 3) ─────────────────────────
+// The status flip on failed post-processing is unconditional; only the LOG
+// line is rate-limited — the 1st failure and every 100th thereafter.
+void test_note_post_failure_cadence() {
+    TEST(note_post_failure_cadence);
+
+    HalInferenceOps infer_ops = make_mock_infer_ops();
+    ModelManager mgr(&infer_ops, nullptr, nullptr, nullptr);
+
+    for (uint64_t n = 1; n <= 250; ++n) {
+        uint64_t count = 0;
+        const bool should_log = mgr.note_post_failure("cadence", -2801, &count);
+        ASSERT_EQ(count, n, "count must track the number of failures");
+        const bool expected = (n == 1 || n % 100 == 0);
+        ASSERT_EQ(should_log, expected,
+                  "log gate: 1st and every 100th failure only (n not reported; see cerr)");
+    }
+
+    // Per-model isolation: a different model starts its own cadence.
+    uint64_t count = 0;
+    ASSERT_TRUE(mgr.note_post_failure("other_model", -1, &count),
+                "first failure of another model logs");
+    ASSERT_EQ(count, 1u, "other model's count is independent");
+
+    PASS();
+}
+
+// ─── Test: gRPC registration variant validation (Fix 5) ──────────────────────
+// Mirrors the REST boundary: closed 7-key detection schema, backend_function
+// whitelist, keypoint bare-name refusal, fail-closed on malformed JSON.
+void test_validate_model_variant_table() {
+    TEST(validate_model_variant_table);
+
+    // The exact blob shape model_manager composes for a bare backend_function
+    // (init_post_process) — the canonical valid full config.
+    const std::string full_blob =
+        R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+        R"("detection_threshold":0.25,"output_activation":"none",)"
+        R"("label_offset":1,"max_boxes":64,)"
+        R"("labels":["unlabeled","person","vehicle","face","license_plate"]})";
+    // Same blob with an injected loader key — must be refused as unknown.
+    const std::string injected =
+        R"({"backend_function":"hailo_yolov8s","iou_threshold":0.45,)"
+        R"("detection_threshold":0.25,"output_activation":"none",)"
+        R"("label_offset":1,"max_boxes":64,"labels":[],)"
+        R"("backend_lib_path":"/evil.so"})";
+    // All 7 keys present but the backend is not whitelisted.
+    const std::string wrong_backend =
+        R"({"backend_function":"yolov5m_vehicles_v2","iou_threshold":0.45,)"
+        R"("detection_threshold":0.25,"output_activation":"none",)"
+        R"("label_offset":1,"max_boxes":64,"labels":[]})";
+
+    struct Case {
+        std::string type;
+        std::string variant;
+        bool ok;               // true = accept (""), false = refuse
+        std::string fragment;  // required fragment of the refusal reason
+    };
+    const std::vector<Case> cases = {
+        // ── accepted ──
+        {"detection", "", true, ""},
+        {"yolo", "", true, ""},
+        {"keypoint", "", true, ""},
+        {"segmentation", "", true, ""},
+        {"ocr_recognition", "", true, ""},
+        {"detection", full_blob, true, ""},
+        {"yolo", "hailo_yolov8n", true, ""},          // bare whitelisted name
+        {"detection", "yolov5m_vehicles", true, ""},  // 4th whitelist entry
+        {"detection", "  hailo_yolov8m  ", true, ""}, // bare name is trimmed
+        {"DETECTION", "hailo_yolov8s", true, ""},     // type case-insensitive
+        // keypoint/other blobs pass through (HAL/plugin validates content)
+        {"keypoint", R"({"native_yolov8_pose":true})", true, ""},
+        {"segmentation", R"({"any":"content"})", true, ""},
+        // ── refused: whitelist ──
+        {"detection", "hailo_yolov9x", false, "Invalid model_variant"},
+        {"detection", "wrong-lib", false, "Invalid model_variant"},
+        {"detection", wrong_backend, false, "not a known detection backend"},
+        // ── refused: closed schema ──
+        {"detection", R"({"backend_function":"hailo_yolov8n"})", false,
+         "missing required key 'iou_threshold'"},
+        {"detection", injected, false, "unknown key 'backend_lib_path'"},
+        // ── refused: keypoint bare name keeps the wrong decoder ──
+        {"keypoint", "native_yolov8_pose", false, "full JSON config blob"},
+        {"landmarks", "facial_landmarks_nv12", false, "full JSON config blob"},
+        // ── refused: malformed JSON (fail-closed) ──
+        {"detection", R"({"backend_function":"hailo_yolov8s",})", false,
+         "not a valid flat JSON object"},                       // trailing comma
+        {"detection", R"({"backend_function":"hailo_yolov8s})", false,
+         "not a valid flat JSON object"},                       // unterminated string
+        {"detection", R"({"backend_function":5})", false,
+         "not a valid flat JSON object"},                       // non-string backend
+        {"detection", R"({"iou_threshold":0.4,"iou_threshold":0.5})", false,
+         "not a valid flat JSON object"},                       // duplicate key
+        {"detection", full_blob + "x", false,
+         "not a valid flat JSON object"},                       // trailing garbage
+    };
+
+    for (const auto& c : cases) {
+        const std::string err = validate_model_variant(c.type, c.variant);
+        if (c.ok) {
+            ASSERT_TRUE(err.empty(),
+                        ("expected accept, got refusal: " + err +
+                         " [variant=" + c.variant + "]").c_str());
+        } else {
+            ASSERT_TRUE(!err.empty(),
+                        ("expected refusal for variant=" + c.variant).c_str());
+            ASSERT_TRUE(err.find(c.fragment) != std::string::npos,
+                        ("refusal '" + err + "' lacks fragment '" +
+                         c.fragment + "'").c_str());
+        }
+    }
+
+    // Type recognition mirrors init_post_process's dispatch — including the
+    // plural-only "landmarks" (a singular "landmark" would silently default
+    // to detection inside init_post_process, the exact trap Fix 5 closes).
+    ASSERT_TRUE(is_known_model_type("detection"), "detection is known");
+    ASSERT_TRUE(is_known_model_type("Detection"), "type match is case-insensitive");
+    ASSERT_TRUE(is_known_model_type("landmarks"), "landmarks (plural) is known");
+    ASSERT_TRUE(is_known_model_type("yolo"), "yolo is known");
+    ASSERT_TRUE(is_known_model_type("ocr_recognition"), "ocr_recognition is known");
+    ASSERT_TRUE(is_known_model_type("monocular_depth"), "monocular_depth is known");
+    ASSERT_FALSE(is_known_model_type("detectin"), "typo'd type is unknown");
+    ASSERT_FALSE(is_known_model_type("landmark"),
+                 "singular 'landmark' is NOT known (init_post_process only knows the plural)");
+    ASSERT_FALSE(is_known_model_type(""),
+                 "empty type is not 'known' (callers accept it separately)");
+
+    // Whitelist membership used by both the bare-name and blob paths.
+    ASSERT_TRUE(is_known_detection_backend("hailo_yolov8n"), "yolov8n whitelisted");
+    ASSERT_TRUE(is_known_detection_backend("hailo_yolov8s"), "yolov8s whitelisted");
+    ASSERT_TRUE(is_known_detection_backend("hailo_yolov8m"), "yolov8m whitelisted");
+    ASSERT_TRUE(is_known_detection_backend("yolov5m_vehicles"),
+                "yolov5m_vehicles whitelisted (Go-side 4-entry set)");
+    ASSERT_FALSE(is_known_detection_backend("hailo_yolov8x"), "yolov8x not whitelisted");
+    ASSERT_FALSE(is_known_detection_backend("backend_function"),
+                 "a key name is not a backend function");
 
     PASS();
 }
@@ -1983,6 +2171,9 @@ int main() {
 
     test_hal_loader();
     test_model_manager();
+    test_postprocess_create_failure_keeps_model_registered();
+    test_note_post_failure_cadence();
+    test_validate_model_variant_table();
     test_owner_scoped_unregister();
     test_force_unregister_all_is_atomic_when_busy();
     test_model_alias_refcount();

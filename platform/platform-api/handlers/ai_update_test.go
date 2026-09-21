@@ -52,6 +52,10 @@ type fakeAIRuntime struct {
 	// smokeHang makes Infer block until its ctx dies — the deterministic way
 	// to exhaust a load deadline inside the smoke test stage.
 	smokeHang bool
+	// smokeDropPostResult makes Infer answer success without a post_result —
+	// the shape a broken postprocess plugin now produces (Fix 4's smoke
+	// check must catch it and fail the load).
+	smokeDropPostResult bool
 }
 
 func (f *fakeAIRuntime) UnregisterModel(_ context.Context, in *inferencepb.ModelInfo) (*inferencepb.Status, error) {
@@ -153,15 +157,21 @@ func (f *fakeAIRuntime) GetModelInfo(ctx context.Context, in *inferencepb.ModelI
 	return f.UnimplementedInferenceServiceServer.GetModelInfo(ctx, in)
 }
 
-// Infer is the smoke-test endpoint: by default it succeeds instantly; with
+// Infer is the smoke-test endpoint: by default it succeeds instantly with an
+// empty post_result (the structured-output contract for typed models); with
 // smokeHang set it blocks until its ctx is cancelled, which is how tests
-// exhaust a load deadline exactly at the smoke stage.
+// exhaust a load deadline exactly at the smoke stage; with
+// smokeDropPostResult set it answers success with NO post_result.
 func (f *fakeAIRuntime) Infer(ctx context.Context, _ *inferencepb.InferRequest) (*inferencepb.InferResponse, error) {
 	if f.smokeHang {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	return &inferencepb.InferResponse{}, nil
+	resp := &inferencepb.InferResponse{}
+	if !f.smokeDropPostResult {
+		resp.PostResult = &inferencepb.PostResult{}
+	}
+	return resp, nil
 }
 
 // markLive seeds the runtime with a model no RegisterModel call created

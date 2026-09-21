@@ -627,7 +627,12 @@ int ModelManager::update_postprocess_config(const std::string& model_id,
     std::unique_lock lock(mu_);
     auto it = models_.find(model_id);
     if (it == models_.end()) return -1;
-    if (!it->second.post_session.session) return -2;
+    if (!it->second.post_session.session) {
+        LOG_WARN("%s: no postprocess session (registered without model_type) "
+                 "— runtime config updates need a re-registration with model_type",
+                 model_id.c_str());
+        return -2;
+    }
     if (!post_ops_ || !post_ops_->apply_config_json) return -3;
     int rc = post_ops_->apply_config_json(it->second.post_session.session, config_json.c_str());
     if (rc == 0) {
@@ -636,6 +641,26 @@ int ModelManager::update_postprocess_config(const std::string& model_id,
         LOG_WARN("Postprocess config update failed for %s: rc=%d", model_id.c_str(), rc);
     }
     return rc;
+}
+
+// ============================================================
+// note_post_failure
+// ============================================================
+
+// Journal rate limit for per-frame post-process failures: log the 1st and
+// then every 100th failure per model. The response status flip is NOT
+// throttled — every caller still reports failure to its client.
+static constexpr uint64_t kPostFailLogInterval = 100;
+
+bool ModelManager::note_post_failure(const std::string& model_id, int rc,
+                                     uint64_t* count_out) {
+    (void)rc;
+    std::unique_lock lock(mu_);
+    uint64_t& count = post_fail_counts_[model_id];
+    ++count;
+    if (count_out)
+        *count_out = count;
+    return count == 1 || count % kPostFailLogInterval == 0;
 }
 
 // ============================================================

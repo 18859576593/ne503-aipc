@@ -104,6 +104,10 @@ const DefaultDetectionProfile = "hailo_yolov8n_384_640"
 // DetectionPostprocessProfiles lists the basenames verified against the
 // vendor plugin. Other compiled-in names map to generic single-argument
 // functions with a hardcoded 0.4 threshold and are deliberately excluded.
+// The backend_function set below (4 entries) is mirrored by the gRPC
+// RegisterModel validator in
+// platform/ai-runtime/src/model_variant_validation.cpp — extend both sides
+// together.
 var DetectionPostprocessProfiles = []DetectionPostprocessProfile{
 	{Basename: "hailo_yolov8n_384_640", BackendFunction: "hailo_yolov8n", Label: "YOLOv8n 384x640 (default)"},
 	{Basename: "hailo_yolov8s_384_640", BackendFunction: "hailo_yolov8s", Label: "YOLOv8s 384x640"},

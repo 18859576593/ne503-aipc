@@ -38,9 +38,12 @@ type stubInferenceClient struct {
 	infos         map[string]*inferencepb.ModelInfo // GetModelInfo results by model id
 	inferCalls    []string                          // model ids probed via Infer
 	inferFail     string                            // non-empty: Infer reports this failure
-	unregErr      error
-	unregStatus   *inferencepb.Status
-	stateful      map[string]*inferencepb.ModelInfo
+	// inferDropPostResult makes a successful Infer carry no post_result — the
+	// shape a broken postprocess plugin produces; the smoke test must fail.
+	inferDropPostResult bool
+	unregErr            error
+	unregStatus         *inferencepb.Status
+	stateful            map[string]*inferencepb.ModelInfo
 }
 
 func (c *stubInferenceClient) ListModels(ctx context.Context, in *inferencepb.Empty, opts ...grpc.CallOption) (*inferencepb.ModelListResponse, error) {
@@ -98,7 +101,13 @@ func (c *stubInferenceClient) Infer(ctx context.Context, in *inferencepb.InferRe
 	if c.inferFail != "" {
 		return &inferencepb.InferResponse{Status: &inferencepb.Status{Success: false, Message: c.inferFail}}, nil
 	}
-	return &inferencepb.InferResponse{Status: &inferencepb.Status{Success: true}}, nil
+	resp := &inferencepb.InferResponse{Status: &inferencepb.Status{Success: true}}
+	if !c.inferDropPostResult {
+		// Typed registrations must produce structured output; the smoke test
+		// rejects a success response without it.
+		resp.PostResult = &inferencepb.PostResult{}
+	}
+	return resp, nil
 }
 
 func newValidationServer(client inferencepb.InferenceServiceClient, enabled bool) *AppManagerServer {
