@@ -3949,6 +3949,7 @@ void CameraDaemon::start_grpc_server() {
         auto lens_bundle = CreateLensHalService(lens_cfg);
         lens_controller_ = lens_bundle.controller;
         lens_hal_service_ = std::move(lens_bundle.service);
+        lens_ensure_bootstrapped_ = std::move(lens_bundle.ensure_bootstrapped);
         if (lens_hal_service_) {
             builder.RegisterService(lens_hal_service_.get());
             HAL_LOG_INFO("CameraDaemon: LensHAL service registered (bridge=%s)", config_.lens_bridge_lib.c_str());
@@ -4072,6 +4073,21 @@ void CameraDaemon::start_grpc_server() {
 
     start_lens_position_recorder();
 
+    // Headless-boot lens self-init (FG2009). The lens bootstrap normally
+    // only runs when lens API traffic reaches device-control's
+    // ensureLensBootstrapped; on a boot nobody polls, that never happens
+    // and the restore / identity-probe threads wait on a lens that never
+    // initializes (overnight 2026-09-21 incident: fixed lens shipped
+    // motorized UI until the first page view). The loop gives the RPC path
+    // a grace period to win, then triggers the same Init sequence itself.
+    if (config_.lens_model == "fg2009" && config_.lens_self_init_enabled &&
+        lens_ensure_bootstrapped_) {
+        HAL_LOG_INFO("CameraDaemon: lens boot self-init armed");
+        lens_boot_ensure_stop_ = false;
+        lens_boot_ensure_thread_ =
+            std::thread(&CameraDaemon::lens_boot_ensure_loop, this);
+    }
+
     if (autofocus_controller_) {
         autofocus_controller_->start();
         const bool restore_instead =
@@ -4125,6 +4141,43 @@ void CameraDaemon::start_grpc_server() {
     }
 }
 
+void CameraDaemon::lens_boot_ensure_loop() {
+    // Grace window: a lens API burst right after boot (open web page,
+    // device-control ensureLensBootstrapped) initializes the lens through
+    // the existing path — let it win and touch no motors.
+    for (int waited = 0; waited < 3000; waited += 200) {
+        if (lens_boot_ensure_stop_.load()) return;
+        if (lens_controller_ && lens_controller_->initialized()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (lens_boot_ensure_stop_.load()) return;
+    if (!lens_controller_ || !lens_ensure_bootstrapped_) return;
+    if (lens_controller_->initialized()) return;
+
+    // Bounded retries: a boot-time UART/MCU hiccup must not strand the
+    // lens for the whole uptime (the probe's readiness wait cannot recover
+    // an init that never ran). Total span ~2 min, inside the probe's 300 s
+    // readiness budget; each attempt re-checks the RPC trigger first.
+    for (int attempt = 1; attempt <= 4; ++attempt) {
+        if (lens_boot_ensure_stop_.load() || !lens_ensure_bootstrapped_) return;
+        if (lens_controller_ && lens_controller_->initialized()) return;
+        HAL_LOG_INFO("CameraDaemon: lens boot self-init attempt %d "
+                     "(no RPC init observed)", attempt);
+        const int ret = lens_ensure_bootstrapped_();
+        if (ret == 0) {
+            HAL_LOG_INFO("CameraDaemon: lens boot self-init complete");
+            return;
+        }
+        HAL_LOG_WARNING("CameraDaemon: lens boot self-init failed: %d", ret);
+        for (int slept = 0; slept < 30000; slept += 500) {
+            if (lens_boot_ensure_stop_.load()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    HAL_LOG_WARNING("CameraDaemon: lens boot self-init gave up; lens API "
+                    "traffic can still initialize the lens");
+}
+
 void CameraDaemon::lens_image_probe_loop() {
     LensImageProbeConfig pc;
     pc.steps = config_.lens_image_probe_steps;
@@ -4141,54 +4194,91 @@ void CameraDaemon::lens_image_probe_loop() {
     pc.luma_guard_ratio = config_.lens_image_probe_luma_guard_ratio;
     pc.stream_name = config_.autofocus.stream_name;
 
-    /* Serialize with the archived-position restore: its replay moves run
-     * outside any autofocus job (no busy flag, no operation lock), so a
-     * probe starting mid-restore would interleave focus commands with its
-     * measurement and could produce an invalid verdict or final position.
-     * The restore thread always terminates on its own (bounded readiness
-     * wait + bounded moves); the cap only guards future regressions. */
-    const auto restore_deadline = std::chrono::steady_clock::now() +
-                                  std::chrono::minutes(10);
-    while (fg2009_restore_active_.load()) {
-        if (lens_image_probe_stop_.load()) return;
-        if (std::chrono::steady_clock::now() >= restore_deadline) {
-            HAL_LOG_WARNING("CameraDaemon: lens image probe skipped "
-                            "(position restore still running)");
+    /* Retry with backoff when inconclusive: readiness misses (lens init
+     * slower than the window, transient AF activity) and low-texture scenes
+     * must not strand the identity for the whole boot — the fg2009 default
+     * leaves motor controls live on a motorless lens. Confident verdicts
+     * (fixed/motorized) apply once and stop. */
+    const int total_attempts = 1 + std::max(0, config_.lens_image_probe_retries);
+    const int retry_interval_ms =
+        std::max(1000, config_.lens_image_probe_retry_interval_ms);
+    int attempts_left = total_attempts;
+    while (true) {
+        /* Serialize with the archived-position restore: its replay moves run
+         * outside any autofocus job (no busy flag, no operation lock), so a
+         * probe starting mid-restore would interleave focus commands with its
+         * measurement and could produce an invalid verdict or final position.
+         * The restore thread always terminates on its own (bounded readiness
+         * wait + bounded moves); the cap only guards future regressions. */
+        const auto restore_deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::minutes(10);
+        while (fg2009_restore_active_.load()) {
+            if (lens_image_probe_stop_.load()) return;
+            if (std::chrono::steady_clock::now() >= restore_deadline) {
+                HAL_LOG_WARNING("CameraDaemon: lens image probe skipped "
+                                "(position restore still running)");
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+
+        double return_dev = 1.0;
+        const LensImageProbeResult result = run_lens_image_probe(
+            hal_loader_->isp(), video_source_->video_ctx(), frame_router_.get(),
+            lens_controller_, autofocus_controller_.get(), pc,
+            &lens_image_probe_stop_, &return_dev);
+        HAL_LOG_INFO("CameraDaemon: lens image probe verdict: %s",
+                     lens_image_probe_result_name(result));
+        if (result == LensImageProbeResult::FixedLens) {
+            // Verified motorless: reject every motion request from now on and
+            // leave the identity decision out of the user's hands.
+            if (lens_controller_) lens_controller_->mark_fixed_lens();
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    double return_dev = 1.0;
-    const LensImageProbeResult result = run_lens_image_probe(
-        hal_loader_->isp(), video_source_->video_ctx(), frame_router_.get(),
-        lens_controller_, autofocus_controller_.get(), pc,
-        &lens_image_probe_stop_, &return_dev);
-    HAL_LOG_INFO("CameraDaemon: lens image probe verdict: %s",
-                 lens_image_probe_result_name(result));
-    if (result == LensImageProbeResult::FixedLens && lens_controller_) {
-        // Verified motorless: reject every motion request from now on and
-        // leave the identity decision out of the user's hands.
-        lens_controller_->mark_fixed_lens();
-    } else if (result == LensImageProbeResult::Motorized &&
-               return_dev > pc.return_ratio && autofocus_controller_) {
-        // The probe proved the motor but its return jog left the focus
-        // short of the baseline (open-loop hysteresis). Refine once so the
-        // shipped image is as sharp as before the probe touched the lens.
-        uint64_t refine_job = 0;
-        std::string refine_error;
-        if (autofocus_controller_->start_one_shot(&refine_job, &refine_error)) {
-            HAL_LOG_INFO("CameraDaemon: post-probe focus refinement job %llu "
-                         "queued (return deviation %.1f%%)",
-                         (unsigned long long)refine_job, return_dev * 100.0);
-        } else {
-            HAL_LOG_WARNING("CameraDaemon: post-probe refinement rejected: %s",
-                            refine_error.c_str());
+        if (result == LensImageProbeResult::Motorized) {
+            // The probe proved the motor; its return jog may have left the
+            // focus short of the baseline (open-loop hysteresis). Refine once
+            // so the shipped image is as sharp as before the probe touched
+            // the lens.
+            if (return_dev > pc.return_ratio && autofocus_controller_) {
+                uint64_t refine_job = 0;
+                std::string refine_error;
+                if (autofocus_controller_->start_one_shot(&refine_job, &refine_error)) {
+                    HAL_LOG_INFO("CameraDaemon: post-probe focus refinement job %llu "
+                                 "queued (return deviation %.1f%%)",
+                                 (unsigned long long)refine_job, return_dev * 100.0);
+                } else {
+                    HAL_LOG_WARNING("CameraDaemon: post-probe refinement rejected: %s",
+                                    refine_error.c_str());
+                }
+            }
+            return;
+        }
+        if (--attempts_left <= 0) {
+            HAL_LOG_WARNING("CameraDaemon: lens image probe inconclusive after "
+                            "%d attempt(s); identity stays fg2009",
+                            total_attempts);
+            return;
+        }
+        HAL_LOG_INFO("CameraDaemon: lens image probe inconclusive; retrying in "
+                     "%d ms (%d attempt(s) left)",
+                     retry_interval_ms, attempts_left);
+        for (int slept = 0; slept < retry_interval_ms; slept += 500) {
+            if (lens_image_probe_stop_.load()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
 }
 
 void CameraDaemon::stop_grpc_server() {
+    // Join the boot self-init thread first: it calls into the lens service,
+    // which is torn down below. An in-flight attempt holds the lens mutex
+    // for at most one bootstrap (~30 s), so this join can only block that
+    // long during the boot window.
+    if (lens_boot_ensure_thread_.joinable()) {
+        lens_boot_ensure_stop_ = true;
+        lens_boot_ensure_thread_.join();
+    }
     // Join the image probe first: it moves the lens and samples ISP stats,
     // both torn down below (lens service, AF controller, video pipeline).
     if (lens_image_probe_thread_.joinable()) {
@@ -4215,6 +4305,7 @@ void CameraDaemon::stop_grpc_server() {
     }
     lens_controller_ = nullptr;
     lens_hal_service_.reset();
+    lens_ensure_bootstrapped_ = nullptr;
     camera_control_service_.reset();
     illumination_controller_.reset();
 }

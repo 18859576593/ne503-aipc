@@ -280,13 +280,21 @@ public:
             return grpc::Status::OK;
         }
 
+        init_locked(resp);
+        return grpc::Status::OK;
+    }
+
+    // Full init sequence shared by the Init RPC and the boot self-init
+    // hook: io_init → lens_init (one retry) → lens_config → per-model
+    // anchoring. Caller holds mu_.
+    int init_locked(aipc::lens::HalStatus* resp) {
         // io_init
         int ret = sym_.io_init(cfg_.serial_device.c_str(),
                                cfg_.baud_rate, cfg_.timeout_ms);
         if (ret != 0) {
             HAL_LOG_ERROR("LensHAL: io_init failed: %d", ret);
             fill_status(resp, ret, "io_init failed");
-            return grpc::Status::OK;
+            return ret;
         }
 
         // lens_init with retry (mirrors Go code)
@@ -299,7 +307,7 @@ public:
             if (ret != 0) {
                 HAL_LOG_ERROR("LensHAL: lens_init retry failed: %d", ret);
                 fill_status(resp, ret, "lens_init failed after retry");
-                return grpc::Status::OK;
+                return ret;
             }
         }
 
@@ -308,7 +316,7 @@ public:
         if (ret != 0) {
             HAL_LOG_ERROR("LensHAL: lens_config failed: %d", ret);
             fill_status(resp, ret, "lens_config failed");
-            return grpc::Status::OK;
+            return ret;
         }
 
         if (fg2009_) {
@@ -317,10 +325,10 @@ public:
             const int fret = finish_init_fg2009_locked();
             if (fret != HAL_OK) {
                 fill_status(resp, fret, "fg2009 init failed");
-                return grpc::Status::OK;
+                return fret;
             }
             fill_status(resp, 0, "ok");
-            return grpc::Status::OK;
+            return 0;
         }
 
         // Set limits
@@ -335,7 +343,24 @@ public:
         HAL_LOG_INFO("LensHAL: initialized (dev=%s baud=%u)",
                      cfg_.serial_device.c_str(), cfg_.baud_rate);
         fill_status(resp, 0, "ok");
-        return grpc::Status::OK;
+        return 0;
+    }
+
+    // Boot-time self-init for headless units. device-control only runs the
+    // init sequence when lens API traffic arrives (ensureLensBootstrapped),
+    // so a boot nobody polls would leave the lens uninitialized forever —
+    // the identity probe times out and a fixed lens ships motorized UI.
+    // Atomic with the RPC paths under mu_: whichever trigger wins the race,
+    // the other side's check makes it a no-op.
+    int EnsureBootstrapped() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (initialized_) return HAL_OK;
+        if (!bridge_loaded_) return -1;
+        if (af_operation_active_.load()) return HAL_ERR_INVALID_STATE;
+        HAL_LOG_INFO("LensHAL: boot self-init (no RPC init observed)");
+        aipc::lens::HalStatus resp;
+        init_locked(&resp);
+        return resp.hal_code();
     }
 
     grpc::Status ReInit(grpc::ServerContext* /*ctx*/,
@@ -1619,6 +1644,9 @@ LensHalServiceBundle CreateLensHalService(const LensHalConfig& cfg) {
     LensHalServiceBundle bundle;
     auto service = std::make_unique<LensHalServiceImpl>(cfg);
     bundle.controller = service.get();
+    bundle.ensure_bootstrapped = [impl = service.get()] {
+        return impl->EnsureBootstrapped();
+    };
     bundle.service = std::move(service);
     return bundle;
 }

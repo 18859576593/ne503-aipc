@@ -244,66 +244,6 @@ static void select_product_media_config_for_infrared(DaemonConfig& config) {
     config.media_config_path = kProductMediaConfig;
 }
 
-/* Lens model from the factory EEPROM (CTFB v1): the HWREV identity field is
- * factory-station burned with "AF0832" or "FG2009" — the single source for
- * the lens branch (product.yaml is no longer consulted). Returns
- * "af0832"/"fg2009", or "" when the EEPROM carries no recognized model
- * (unprogrammed, no valid slot, HAL library unavailable) so the caller
- * defaults to af0832. */
-static std::string read_eeprom_lens_model(const DaemonConfig& config) {
-    const std::string& lib_path = config.video_lib;
-    if (lib_path.empty()) {
-        HAL_LOG_INFO("Lens model: no HAL library configured; factory EEPROM skipped");
-        return "";
-    }
-    /* RTLD_LOCAL + quick dlopen/dlclose: this runs before the daemon's real
-     * HAL load; refcounting makes the later dlopen independent. */
-    void* handle = dlopen(lib_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
-    if (!handle) {
-        HAL_LOG_INFO("Lens model: cannot load '%s' for factory EEPROM (%s)",
-                     lib_path.c_str(), dlerror());
-        return "";
-    }
-    std::string model;
-    HalFactoryOps* ops = nullptr;
-    *reinterpret_cast<void**>(&ops) = dlsym(handle, "HAL_FACTORY_OPS");
-    if (ops && ops->init && ops->get && ops->deinit) {
-        void* ctx = nullptr;
-        if (ops->init(nullptr, &ctx) == 0 && ctx) {
-            char value[16] = {0};
-            const int ret = ops->get(ctx, HAL_FACTORY_FIELD_HWREV, value, sizeof(value));
-            ops->deinit(ctx);
-            if (ret == 0) {
-                std::string v = trim(std::string(value));
-                for (char& ch : v) {
-                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                }
-                if (v == "af0832" || v == "fg2009") {
-                    model = v;
-                } else if (!v.empty()) {
-                    HAL_LOG_WARNING("Lens model: factory EEPROM HWREV '%s' is not a "
-                                    "lens model; defaulting to af0832",
-                                    v.c_str());
-                } else {
-                    HAL_LOG_INFO("Lens model: factory EEPROM present but HWREV "
-                                 "unprogrammed; defaulting to af0832");
-                }
-            } else {
-                HAL_LOG_INFO("Lens model: factory EEPROM read failed (ret=%d); "
-                             "defaulting to af0832", ret);
-            }
-        } else {
-            HAL_LOG_INFO("Lens model: factory EEPROM init failed (no at24 node?); "
-                         "defaulting to af0832");
-        }
-    } else {
-        HAL_LOG_INFO("Lens model: '%s' exports no HAL_FACTORY_OPS; defaulting to af0832",
-                     lib_path.c_str());
-    }
-    dlclose(handle);
-    return model;
-}
-
 /* Adaptive lens probe (differential iris test). AF0832 carries a physical
  * iris driven by a Hall closed loop; FG2009 has none — iris register writes
  * still succeed (the driver chip is shared), but the ADC reading cannot move.
@@ -313,7 +253,7 @@ static std::string read_eeprom_lens_model(const DaemonConfig& config) {
  * session down (the service re-initializes the MCU afterwards, same as a
  * daemon restart). Returns "af0832"/"fg2009", or "" when the probe could not
  * run (no bridge, MCU not answering, ambiguous movement) so the caller falls
- * back to the factory EEPROM. */
+ * back to the af0832 default. */
 static std::string probe_lens_model(const DaemonConfig& config) {
     const std::string& lib_path = config.lens_bridge_lib;
     if (lib_path.empty()) {
@@ -416,10 +356,10 @@ static std::string probe_lens_model(const DaemonConfig& config) {
                     if (target < 0) target = 0;
                 }
                 /* A failed drive leaves the ADC untouched, which here would
-                 * read as "no iris" and misfile a real AF0832 as fg2009 —
-                 * and the probe outranks the EEPROM. Treat a command
-                 * failure as an inconclusive probe (result stays empty) and
-                 * let the identity chain fall back. */
+                 * read as "no iris" and misfile a real AF0832 as fg2009.
+                 * Treat a command failure as an inconclusive probe (result
+                 * stays empty) and let the identity chain fall back to the
+                 * af0832 default. */
                 bool drive_ok = false;
                 if (iris_target_set(1, target) == 0 && iris_run(1, 0, 0) == 0) {
                     iris_perturbed = true;
@@ -509,33 +449,21 @@ static std::string probe_lens_model(const DaemonConfig& config) {
     return result;
 }
 
-/* Applies the lens model identity: the adaptive iris probe decides first;
- * the factory EEPROM HWREV field (burned at the factory station) is the
- * fallback when the probe cannot run; af0832 is the last-resort default so
- * an unprogrammed unit still boots. A probe/EEPROM conflict warns and the
- * probe wins. */
+/* Applies the lens model identity: pure software adaptivity only. The
+ * adaptive iris probe (with its PI auxiliary probe) decides; af0832 is the
+ * last-resort default so an unprobed unit still boots. The factory EEPROM
+ * is deliberately not consulted — lens identity must not depend on what a
+ * factory station burned (a mis-stamped unit would boot the wrong lens
+ * branch with no runtime correction). */
 static void apply_lens_model_identity(DaemonConfig& config) {
     const std::string probed = probe_lens_model(config);
-    const std::string eeprom_model = read_eeprom_lens_model(config);
     if (!probed.empty()) {
-        if (!eeprom_model.empty() && eeprom_model != probed) {
-            HAL_LOG_WARNING("Lens model conflict: probe '%s' vs factory EEPROM '%s' "
-                            "— probe wins",
-                            probed.c_str(), eeprom_model.c_str());
-        }
         config.lens_model = probed;
         HAL_LOG_INFO("Lens product model: %s (adaptive iris probe)", probed.c_str());
         return;
     }
-
-    if (!eeprom_model.empty()) {
-        config.lens_model = eeprom_model;
-        HAL_LOG_INFO("Lens product model: %s (from factory EEPROM HWREV)",
-                     eeprom_model.c_str());
-        return;
-    }
     config.lens_model = "af0832";
-    HAL_LOG_INFO("Lens product model: af0832 (probe and EEPROM carry no lens model)");
+    HAL_LOG_INFO("Lens product model: af0832 (probe carried no lens model)");
 }
 
 /* Per-lens IR profile: both lens versions share one media config, but each
@@ -1058,6 +986,12 @@ static DaemonConfig load_config(const std::string& path) {
                     cfg.lens_image_probe_pps = (int)parse_u32_config(val, "lens.image_probe_pps", HAL_LENS_FG2009_MAX_PPS);
                 else if (trimmed.find("image_probe_ready_timeout_ms:") != std::string::npos)
                     cfg.lens_image_probe_ready_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_ready_timeout_ms");
+                else if (trimmed.find("image_probe_retries:") != std::string::npos)
+                    cfg.lens_image_probe_retries = (int)parse_u32_config(val, "lens.image_probe_retries");
+                else if (trimmed.find("image_probe_retry_interval_ms:") != std::string::npos)
+                    cfg.lens_image_probe_retry_interval_ms = (int)parse_u32_config(val, "lens.image_probe_retry_interval_ms");
+                else if (trimmed.find("self_init_enabled:") != std::string::npos)
+                    cfg.lens_self_init_enabled = (int)parse_u32_config(val, "lens.self_init_enabled");
                 else if (trimmed.find("image_probe_move_timeout_ms:") != std::string::npos)
                     cfg.lens_image_probe_move_timeout_ms = (int)parse_u32_config(val, "lens.image_probe_move_timeout_ms");
                 else if (trimmed.find("image_probe_texture_floor:") != std::string::npos)
