@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <condition_variable>
@@ -279,13 +280,27 @@ struct DaemonConfig {
     // (statistics dip and return) or nothing is attached (statistics flat on
     // a textured scene). Runs deferred after the lens parks and the boot
     // autofocus pass completes; bench-tunable via lens.image_probe.* keys.
+    // An inconclusive verdict (slow MCU init, transient AF activity, low
+    // texture) retries with backoff instead of stranding the identity for
+    // the whole boot — the fg2009 default would leave motor controls live
+    // on a motorless lens.
     int lens_image_probe_enabled = 1;
     int lens_image_probe_steps = 250;       // focus jog, curve steps each way
     int lens_image_probe_frames = 5;        // frames per measurement point
     int lens_image_probe_settle_ms = 400;   // mechanical settle after a jog
     int lens_image_probe_pps = 600;
-    int lens_image_probe_ready_timeout_ms = 120000;  // lens+AF+stats readiness
+    int lens_image_probe_ready_timeout_ms = 300000;  // lens+AF+stats readiness
     int lens_image_probe_move_timeout_ms = 15000;
+    int lens_image_probe_retries = 4;       // extra attempts when inconclusive
+    int lens_image_probe_retry_interval_ms = 60000;  // backoff between attempts
+
+    // Headless-boot lens self-init (lens.self_init_enabled). The FG2009
+    // bootstrap otherwise only runs when lens API traffic reaches
+    // device-control's ensureLensBootstrapped; on a boot nobody polls the
+    // lens stays uninitialized forever (overnight 2026-09-21 incident:
+    // fixed lens shipped motorized UI until the first page view). AF0832
+    // keeps its legacy lazy init — its boot behavior is unchanged.
+    int lens_self_init_enabled = 1;
     uint32_t lens_image_probe_texture_floor = 3000;  // raw AF sum, bench-calibrated
     float lens_image_probe_motor_ratio = 0.25f;  // dip depth that proves a motor
     float lens_image_probe_flat_ratio = 0.08f;   // flat band (gate + stability)
@@ -812,6 +827,16 @@ private:
     void lens_image_probe_loop();
     std::thread lens_image_probe_thread_;
     std::atomic<bool> lens_image_probe_stop_{true};
+
+    // Headless-boot lens self-init (FG2009): waits out a short grace period
+    // so an RPC trigger from device-control wins if lens traffic shows up,
+    // then runs the Init sequence in-process so the restore and image-probe
+    // threads have an initialized lens to wait on. Joined before the lens
+    // service is torn down (the hook below points into it).
+    void lens_boot_ensure_loop();
+    std::thread lens_boot_ensure_thread_;
+    std::atomic<bool> lens_boot_ensure_stop_{true};
+    std::function<int()> lens_ensure_bootstrapped_;  // bundle hook; valid while lens_hal_service_ lives
 #endif
 
     bool switch_profile_internal(const std::string& profile_name, bool restart_af,
