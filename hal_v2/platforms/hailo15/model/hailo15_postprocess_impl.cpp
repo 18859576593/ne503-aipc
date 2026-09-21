@@ -1050,6 +1050,10 @@ static std::string json_strip_hailo_postprocess_loader_keys(std::string j)
 }
 #endif
 
+// Defined below (after create); create calls it on the fail-loud path so a
+// session whose vendor plugin could not be resolved is never returned.
+static void hailo15_post_destroy(HalPostprocessSession *session);
+
 static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *config)
 {
     if (!config)
@@ -1369,6 +1373,23 @@ static HalPostprocessSession *hailo15_post_create(const HalPostprocessConfig *co
                               p->plugin_function.c_str(), dlerror());
             }
         }
+    }
+
+    // Fail loud: a session whose vendor plugin could not be opened or whose
+    // backend_function symbol could not be resolved would answer every run()
+    // with HAL_ERR_NOT_SUPPORTED — silent no-op post-processing. Callers that
+    // null-check the create result (ai-runtime init_post_process, camera-daemon
+    // dpm_worker) turn this into a visible registration/load failure instead.
+    if (!p->plugin_lib_path.empty() && !p->plugin_function.empty() &&
+        (!p->dl_handle || (!p->post_fn && !p->post_fn_no_params)))
+    {
+        HAL_LOG_ERROR("hailo15_postprocess: vendor plugin unusable (lib=\"%s\" fn=\"%s\": %s)"
+                      " — failing create instead of returning a session whose every frame"
+                      " returns NOT_SUPPORTED",
+                      p->plugin_lib_path.c_str(), p->plugin_function.c_str(),
+                      p->dl_handle ? "dlsym failed for backend_function" : "dlopen failed");
+        hailo15_post_destroy(reinterpret_cast<HalPostprocessSession *>(p));
+        return nullptr;
     }
 #endif
 

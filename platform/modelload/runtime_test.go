@@ -1,7 +1,9 @@
 package modelload
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	inferencepb "aipc/platform/ai-runtime/proto"
 	"aipc/platform/common/constants"
 	"aipc/platform/platform-api/model"
+
+	"google.golang.org/grpc"
 )
 
 // newPostprocessTestEnv points the platform root at a temp dir so
@@ -541,5 +545,97 @@ func TestZeroInputTensor(t *testing.T) {
 	bad := &inferencepb.TensorSpec{Shape: []int32{1, 0, 640}, Dtype: inferencepb.DataType_UINT8}
 	if _, err := zeroInputTensor(bad); err == nil {
 		t.Fatal("expected error for non-positive shape dim")
+	}
+}
+
+// fakeSmokeClient answers only the smoke-test Infer call; every other method
+// of the embedded interface panics, keeping the fake honest about scope.
+type fakeSmokeClient struct {
+	inferencepb.InferenceServiceClient
+	resp *inferencepb.InferResponse
+	err  error
+}
+
+func (c *fakeSmokeClient) Infer(context.Context, *inferencepb.InferRequest, ...grpc.CallOption) (*inferencepb.InferResponse, error) {
+	return c.resp, c.err
+}
+
+// TestRunLoadSmokeTest pins the expectPostResult contract: a registration
+// that declared a postprocess model_type must produce a structured
+// post_result on the probe response; raw registrations skip the demand.
+// Transport error, status refusal and missing tensor info keep their
+// pre-existing behavior.
+func TestRunLoadSmokeTest(t *testing.T) {
+	spec := &inferencepb.TensorSpec{Shape: []int32{1, 10}, Dtype: inferencepb.DataType_FLOAT32}
+	info := &inferencepb.ModelInfo{Inputs: []*inferencepb.TensorSpec{spec}}
+
+	tests := []struct {
+		name        string
+		resp        *inferencepb.InferResponse
+		rpcErr      error
+		modelInfo   *inferencepb.ModelInfo
+		expectPost  bool
+		wantErr     bool
+		errFragment string
+	}{
+		{
+			name:       "success with post_result, expecting one",
+			resp:       &inferencepb.InferResponse{PostResult: &inferencepb.PostResult{}},
+			modelInfo:  info,
+			expectPost: true,
+		},
+		{
+			name:       "success without post_result, raw registration",
+			resp:       &inferencepb.InferResponse{},
+			modelInfo:  info,
+			expectPost: false,
+		},
+		{
+			name:        "success without post_result but typed registration must fail",
+			resp:        &inferencepb.InferResponse{},
+			modelInfo:   info,
+			expectPost:  true,
+			wantErr:     true,
+			errFragment: "postprocess produced no result",
+		},
+		{
+			name:        "status refusal surfaces the runtime message",
+			resp:        &inferencepb.InferResponse{Status: &inferencepb.Status{Success: false, Message: "Postprocess failed (rc=-1)"}},
+			modelInfo:   info,
+			expectPost:  true,
+			wantErr:     true,
+			errFragment: "rc=-1",
+		},
+		{
+			name:        "transport error",
+			rpcErr:      errors.New("connection refused"),
+			modelInfo:   info,
+			wantErr:     true,
+			errFragment: "probe infer failed",
+		},
+		{
+			name:       "nil model info skips the probe entirely",
+			resp:       nil,
+			modelInfo:  nil,
+			expectPost: true, // must not matter: nothing is probed
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeSmokeClient{resp: tt.resp, err: tt.rpcErr}
+			err := RunLoadSmokeTest(context.Background(), client, "m", tt.modelInfo, tt.expectPost)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("RunLoadSmokeTest() = nil, want error")
+				}
+				if !strings.Contains(err.Error(), tt.errFragment) {
+					t.Fatalf("RunLoadSmokeTest() error = %q, want fragment %q", err.Error(), tt.errFragment)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RunLoadSmokeTest() unexpected error: %v", err)
+			}
+		})
 	}
 }

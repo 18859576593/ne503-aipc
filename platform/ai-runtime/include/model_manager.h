@@ -208,6 +208,16 @@ public:
     /// Calls HAL's apply_config_json on the model's postprocess session.
     int update_postprocess_config(const std::string& model_id, const std::string& config_json);
 
+    /// Records a post-process run failure for a model and returns whether the
+    /// caller should emit a log line now. Rate-limits the journal: true on the
+    /// first failure and every kPostFailLogInterval-th thereafter, false in
+    /// between (a broken plugin fails per frame; logging every frame floods).
+    /// When count_out is non-null it receives the failure count after this
+    /// call (for the "failure #N" log line). The status flip on the response
+    /// is NOT rate-limited — only logging is.
+    bool note_post_failure(const std::string& model_id, int rc,
+                           uint64_t* count_out = nullptr);
+
     /// Query system-level NPU/CPU performance stats from HAL.
     /// Returns 0 on success, <0 if unavailable.
     int query_performance_stats(uint32_t sampling_period_ms, HalInferencePerfStats* out);
@@ -236,6 +246,10 @@ private:
     // physically destroyed exactly once, when the last entry releases it.
     std::unordered_map<HalInferenceSession*, int>   infer_refs_;  // infer_session -> refcount
     std::unordered_map<HalPostprocessSession*, int> post_refs_;   // post_session  -> refcount
+
+    // Post-process run failures per model id, for note_post_failure's
+    // rate-limited logging. Guarded by mu_ (unique).
+    std::unordered_map<std::string, uint64_t> post_fail_counts_;
 
     // Require mu_ held. Bump/drop the session refcount; destroy via HAL ops
     // only when the count reaches zero.

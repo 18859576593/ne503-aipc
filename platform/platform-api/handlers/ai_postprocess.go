@@ -21,6 +21,10 @@ import (
 // a partial blob is rejected at load time with a bare "required" error, so
 // user-supplied variant JSON must carry all of them up front. They are also
 // the complete set the REST surface accepts: the schema is closed.
+// The gRPC RegisterModel surface mirrors this closed set (plus the
+// backend_function whitelist below) in
+// platform/ai-runtime/src/model_variant_validation.cpp — keep both sides in
+// sync when the schema or whitelist changes.
 var customVariantKeys = []string{
 	"backend_function",
 	"iou_threshold",

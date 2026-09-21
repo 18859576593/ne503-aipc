@@ -346,8 +346,12 @@ func RemoveRuntimeCopy(modelID string) {
 // vendor plugin) only surface at infer time — RegisterModel succeeds and
 // every frame then fails — so a probe infer at load time catches them while
 // the caller can still roll the registration back. A missing modelInfo skips
-// the probe (nothing to size a tensor from).
-func RunLoadSmokeTest(ctx context.Context, client inferencepb.InferenceServiceClient, modelID string, modelInfo *inferencepb.ModelInfo) error {
+// the probe (nothing to size a tensor from). expectPostResult demands a
+// structured post_result on the probe response: a registration that declared
+// a postprocess model_type must produce one, or the model would serve raw
+// tensors (or nothing) to consumers expecting structured output while the
+// status still says success.
+func RunLoadSmokeTest(ctx context.Context, client inferencepb.InferenceServiceClient, modelID string, modelInfo *inferencepb.ModelInfo, expectPostResult bool) error {
 	if modelInfo == nil || len(modelInfo.Inputs) == 0 {
 		logger.Warn("Skipping load smoke test for %s: no input tensor info available", modelID)
 		return nil
@@ -368,6 +372,9 @@ func RunLoadSmokeTest(ctx context.Context, client inferencepb.InferenceServiceCl
 	}
 	if resp.GetStatus() != nil && !resp.GetStatus().GetSuccess() {
 		return fmt.Errorf("%s", resp.GetStatus().GetMessage())
+	}
+	if expectPostResult && resp.GetPostResult() == nil {
+		return fmt.Errorf("postprocess produced no result for %s (rc!=0 or no session) — the model would return no structured output", modelID)
 	}
 	return nil
 }

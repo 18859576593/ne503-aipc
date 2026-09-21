@@ -213,6 +213,7 @@ set(SOURCES
     src/common.cpp
     src/hal_ml_loader.cpp
     src/model_manager.cpp
+    src/model_variant_validation.cpp
     src/session_manager.cpp
     src/inference_scheduler.cpp
     src/postprocess_pool.cpp
@@ -253,6 +254,7 @@ add_executable(ai-runtime-test
     src/common.cpp
     src/hal_ml_loader.cpp
     src/model_manager.cpp
+    src/model_variant_validation.cpp
     src/session_manager.cpp
     src/inference_scheduler.cpp
     src/postprocess_pool.cpp

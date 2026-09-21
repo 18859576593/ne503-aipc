@@ -1040,8 +1040,24 @@ void AutoInfer::pipeline_loop(
                             int post_rc = mgr->post_process(
                                 pp, deferred->outputs.get(),
                                 deferred->num_outputs, &post_result);
-                            if (post_rc == 0 && eb && eb->connected() &&
-                                eb_publish) {
+                            if (post_rc != 0) {
+                                // No response object to flip on the auto path
+                                // (results go to the event bus); a broken
+                                // plugin would silently publish nothing, so
+                                // at least make the failure visible in the
+                                // journal — rate-limited, not per frame.
+                                uint64_t fail_n = 0;
+                                if (mgr->note_post_failure(model_id, post_rc,
+                                                           &fail_n)) {
+                                    LOG_ERROR("AutoInfer: postprocess failed "
+                                              "for model '%s': rc=%d "
+                                              "(failure #%llu) — no result "
+                                              "published",
+                                              model_id.c_str(), post_rc,
+                                              static_cast<unsigned long long>(
+                                                  fail_n));
+                                }
+                            } else if (eb && eb->connected() && eb_publish) {
                                 std::string topic = "inference/" + stream_id;
                                 std::string payload = post_result_to_json(
                                     stream_id, model_id, frame_seq, ts_ns,
@@ -1054,11 +1070,21 @@ void AutoInfer::pipeline_loop(
                             }
                         }
                     } catch (const std::exception& e) {
-                        LOG_ERROR("AutoInfer: postprocess failed for %s: %s",
-                                  model_id.c_str(), e.what());
+                        uint64_t fail_n = 0;
+                        if (mgr->note_post_failure(model_id, -1, &fail_n)) {
+                            LOG_ERROR("AutoInfer: postprocess failed for %s: %s "
+                                      "(failure #%llu) — no result published",
+                                      model_id.c_str(), e.what(),
+                                      static_cast<unsigned long long>(fail_n));
+                        }
                     } catch (...) {
-                        LOG_ERROR("AutoInfer: postprocess failed for %s",
-                                  model_id.c_str());
+                        uint64_t fail_n = 0;
+                        if (mgr->note_post_failure(model_id, -1, &fail_n)) {
+                            LOG_ERROR("AutoInfer: postprocess failed for %s "
+                                      "(failure #%llu) — no result published",
+                                      model_id.c_str(),
+                                      static_cast<unsigned long long>(fail_n));
+                        }
                     }
                 };
 

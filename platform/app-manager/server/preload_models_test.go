@@ -320,3 +320,30 @@ func TestPreloadModelsBundledLogicalFailureHonorsRequired(t *testing.T) {
 		}
 	})
 }
+
+func TestPreloadModelsSmokeRejectsMissingPostResult(t *testing.T) {
+	// Success-shaped probe with no post_result = broken postprocess: the
+	// smoke test must treat it as a failure and roll the fresh registration
+	// back (previously this shape passed and left a zero-output model live).
+	client := &stubInferenceClient{
+		infos:               map[string]*inferencepb.ModelInfo{"fire_smoke": probeInputs("fire_smoke")},
+		inferDropPostResult: true,
+	}
+	s, _ := newPreloadEnv(t, client, func(root string) map[string]model.AIModel {
+		return map[string]model.AIModel{
+			"fire_smoke": {ModelType: "detection", FilePath: writePreloadBlob(t, root)},
+		}
+	})
+
+	s.PreloadModels(context.Background(), "app-x", preloadManifest("fire_smoke"))
+
+	if len(client.registrations) != 1 || client.registrations[0].ModelId != "fire_smoke" {
+		t.Fatalf("registrations = %+v, want the attempted fire_smoke registration", client.registrations)
+	}
+	if len(client.inferCalls) != 1 || client.inferCalls[0] != "fire_smoke" {
+		t.Errorf("inferCalls = %v, want one fire_smoke probe", client.inferCalls)
+	}
+	if len(client.unregistered) != 1 || client.unregistered[0].ModelId != "fire_smoke" || client.unregistered[0].OwnerId != "app-x" {
+		t.Errorf("unregistered = %+v, want fire_smoke rolled back for owner app-x", client.unregistered)
+	}
+}
