@@ -45,6 +45,13 @@ struct Hailo15MediaPriv
     std::string current_config_field_value;
 
     std::vector<std::string> profile_names;
+    /** Authored iq_settings.grayscale.enabled per profile, snapshotted once at first
+     *  init from the pristine (pre-override) SDK state. The live value is unsafe
+     *  afterwards: set_override_parameters() replaces the stored profile_by_name
+     *  entries with toggled values (see profile_authored_grayscale in
+     *  hailo15_media_impl.cpp). Survives media_lib reinits; deliberately NOT
+     *  rebuilt from patched json. */
+    std::map<std::string, bool> authored_profile_grayscale;
     std::vector<std::string> frontend_stream_ids;
     std::vector<std::string> encoder_stream_ids;
     /** Snapshot after last successful build; used to detect profile-only updates vs stream layout changes. */
