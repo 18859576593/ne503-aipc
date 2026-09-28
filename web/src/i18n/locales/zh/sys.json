@@ -22,7 +22,10 @@
       "save": "保存",
       "saving": "保存中...",
       "ssh_settings": "SSH 设置",
-      "view_all": "查看全部"
+      "view_all": "查看全部",
+      "enabled": "启用",
+      "saved": "已保存",
+      "save_failed_retry": "保存失败，已恢复设备配置"
     },
     "login": {
       "login_title": "登录 CamThink",
@@ -58,7 +61,8 @@
       "latency": "时延",
       "bandwidth": "带宽",
       "preview_disconnected": "预览连接已断开",
-      "volume": "音量"
+      "volume": "音量",
+      "disconnected": "已断开"
     },
     "gyro": {
       "title": "陀螺仪校准",
@@ -327,14 +331,16 @@
       "write_inactive_copy": "写入非活动副本",
       "reboot_now": "立即重启",
       "remove_package": "删除升级包",
-      "reupload_package": "重新上传"
+      "reupload_package": "重新上传",
+      "ota_complete_login_prompt": "固件升级完成，请重新登录"
     },
     "password_settings": {
       "title": "设备密码关闭",
       "status": "密码状态",
       "disable": "禁用密码",
       "enable": "启用密码",
-      "warning": "禁用密码后，任何人都可以访问设备，存在安全风险"
+      "warning": "禁用密码后，任何人都可以访问设备，存在安全风险",
+      "enable_warning": "确定要启用设备密码吗？启用后需要密码才能访问设备。"
     },
     "firmware_settings": {
       "title": "固件升级",
@@ -661,7 +667,17 @@
       "privacy_mask_draw_hint_progress": "点击放置顶点（至少 3 个）。双击闭合多边形。",
       "privacy_mask_draw_hint_close": "双击闭合多边形。",
       "privacy_mask_draw_hint_idle": "点击“添加区域”后在直播画面中点击放置顶点。拖拽顶点可微调。",
-      "privacy_mask_no_regions": "暂无遮罩区域"
+      "privacy_mask_no_regions": "暂无遮罩区域",
+      "daynight_mode": "日夜模式",
+      "daynight_auto_hint": "自动模式：根据光照传感器切换日夜",
+      "infrared_on_hint": "使用红外图像配置并开启红外补光",
+      "infrared_off_hint": "使用日光图像配置并关闭红外补光",
+      "daynight_auto": "自动",
+      "daynight_day": "日间",
+      "daynight_night": "夜间",
+      "light_thresholds": "光照阈值（自动模式）",
+      "night_enter": "进入夜间 ≤",
+      "day_enter": "进入日间 ≥"
     },
     "media_player": {
       "bitrate": "码率",
@@ -1022,39 +1038,6 @@
       "reconnecting": "正在重连...",
       "max_retries_reached": "已达最大重连次数，点击重试"
     },
-    "ssh": {
-      "title": "SSH 配置",
-      "description": "管理 SSH 服务配置和安全设置",
-      "settings": "配置设置",
-      "port": "端口",
-      "port_hint": "默认端口为 22",
-      "permit_root_login": "Root 登录",
-      "port_invalid": "端口范围应为 1-65535",
-      "permit_root": {
-        "yes": "允许",
-        "prohibit_password": "仅密钥",
-        "no": "禁止"
-      },
-      "password_authentication": "密码认证",
-      "pubkey_authentication": "公钥认证",
-      "auth": {
-        "enabled": "启用",
-        "disabled": "禁用"
-      },
-      "max_auth_tries": "最大认证尝试次数",
-      "max_auth_tries_invalid": "最大认证尝试次数范围应为 1-10",
-      "restart_service": "保存后重启 SSH 服务",
-      "logs": "SSH 日志",
-      "no_logs": "暂无日志",
-      "status": {
-        "active": "运行中",
-        "inactive": "已停止",
-        "unknown": "未知"
-      },
-      "update_success": "SSH 配置已更新",
-      "update_error": "SSH 配置更新失败：",
-      "logs_refreshed": "日志已刷新"
-    },
     "file_management": {
       "title": "文件管理",
       "search_placeholder": "搜索文件...",
@@ -1131,12 +1114,25 @@
       "batch_delete_success": "批量删除成功",
       "batch_delete_error": "批量删除失败",
       "confirm_save": "确认保存",
-      "confirm_save_description": "确定要保存更改吗？"
+      "confirm_save_description": "确定要保存更改吗？",
+      "preparing_zip": "正在打包 {{count}} 个文件...",
+      "download_complete": "成功下载 {{count}} 个文件",
+      "batch_download_failed": "批量下载失败",
+      "deleting": "删除中...",
+      "confirm_delete": "确认删除",
+      "batch_delete_confirm": "批量删除确认",
+      "batch_delete_warning": "确定要删除选中的 {{count}} 个文件/文件夹吗？此操作无法撤销。"
     },
     "file_upload": {
       "uploading": "上传中...",
       "add_more_files": "点击或拖拽添加更多文件",
-      "placeholder": "拖拽文件到此处，或点击选择文件"
+      "placeholder": "拖拽文件到此处，或点击选择文件",
+      "file_too_large": "文件过大，最大允许 {{limit}}",
+      "no_limit": "未限制",
+      "file_type_unsupported": "文件类型不支持",
+      "select_file": "选择文件",
+      "upload_image_hint": "点击或拖拽上传图片",
+      "image_formats_hint": "支持 PNG, JPG, GIF, WebP"
     },
     "apps": {
       "title": "应用",
@@ -1215,7 +1211,10 @@
         "resource_load": "资源负载",
         "since_last_hour": "since last hour",
         "stability_index": "Overall stability index",
-        "optimal_allocation": "Optimal allocation active"
+        "optimal_allocation": "Optimal allocation active",
+        "cpu": "CPU",
+        "memory": "内存",
+        "uptime": "运行时长"
       },
       "permissions": {
         "events": "Events"
@@ -1227,7 +1226,9 @@
         "device": "设备控制",
         "network": "网络",
         "light": "补光灯",
-        "lens": "镜头"
+        "lens": "镜头",
+        "video": "视频流",
+        "models": "AI 模型"
       },
       "import": {
         "wizard_title": "应用安装向导",
@@ -1439,7 +1440,12 @@
         "yaml_loading": "编辑器加载中…",
         "yaml_parse_error": "YAML 解析失败",
         "yaml_preview_hint": "只读预览 · 由表单生成 — 可复制用作 app.yaml",
-        "yaml_view_tab": "YAML"
+        "yaml_view_tab": "YAML",
+        "invalid_model_alias": "无效的模型别名：必须以字母或下划线开头，且只能包含字母、数字和下划线",
+        "model_id_required": "有模型依赖项未选择模型，请完成该行或将其删除",
+        "model_unavailable_required": "必需的模型依赖未注册且未声明路径，安装将被阻止。请填写模型路径或选择系统模型。",
+        "yaml_applied": "YAML 修改已应用",
+        "yaml_flush_failed": "应用 YAML 修改失败"
       },
       "logs": {
         "title": "日志",
@@ -1470,7 +1476,15 @@
         "website": "官方网站",
         "docs": "使用文档",
         "version_history": "版本历史",
-        "release_date": "发布日期"
+        "release_date": "发布日期",
+        "permissions": "权限与资源",
+        "info": "应用信息",
+        "id": "ID",
+        "version": "版本",
+        "installed_at": "安装时间",
+        "started_at": "启动时间",
+        "fetch_failed": "无法获取应用详情",
+        "missing_manifest": "应用缺少 manifest_path 信息"
       },
       "terminal": {
         "title": "终端"
@@ -1920,7 +1934,14 @@
         "ir_led_on": "开",
         "ir_led_off": "关",
         "set_success": "设置已更新",
-        "set_failed": "设置更新失败"
+        "set_failed": "设置更新失败",
+        "preset_name_prompt": "预设名称",
+        "preset_saved": "预设已保存",
+        "preset_loaded": "预设已加载",
+        "presets": "预设",
+        "save_preset": "保存当前配置",
+        "no_presets": "暂无预设",
+        "load": "加载"
       },
       "lens": {
         "title": "镜头控制",

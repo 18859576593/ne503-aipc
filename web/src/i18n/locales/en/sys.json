@@ -22,7 +22,10 @@
       "save": "Save",
       "saving": "Saving...",
       "ssh_settings": "SSH Settings",
-      "view_all": "View All"
+      "view_all": "View All",
+      "enabled": "Enabled",
+      "saved": "Saved",
+      "save_failed_retry": "Save failed, device configuration restored"
     },
     "login": {
       "login_title": "Login CamThink",
@@ -58,7 +61,8 @@
       "latency": "Latency",
       "bandwidth": "Bandwidth",
       "preview_disconnected": "Preview Disconnected",
-      "volume": "Volume"
+      "volume": "Volume",
+      "disconnected": "Disconnected"
     },
     "gyro": {
       "title": "Gyroscope Calibration",
@@ -327,14 +331,16 @@
       "write_inactive_copy": "Write Inactive Copy",
       "reboot_now": "Reboot Now",
       "remove_package": "Remove Package",
-      "reupload_package": "Re-upload"
+      "reupload_package": "Re-upload",
+      "ota_complete_login_prompt": "Firmware update complete. Please log in again."
     },
     "password_settings": {
       "title": "Password Disable",
       "status": "Password Status",
       "disable": "Disable Password",
       "enable": "Enable Password",
-      "warning": "Disabling the password poses a security risk as anyone can access the device."
+      "warning": "Disabling the password poses a security risk as anyone can access the device.",
+      "enable_warning": "Enable the device password? A password will be required to access the device."
     },
     "firmware_settings": {
       "title": "Firmware Upgrade",
@@ -661,7 +667,17 @@
       "privacy_mask_draw_hint_progress": "Click to place vertices (need 3 min). Double-click to close the polygon.",
       "privacy_mask_draw_hint_close": "Double-click to close the polygon.",
       "privacy_mask_draw_hint_idle": "Click \"Add Region\" then click on the live video to place vertices. Drag a vertex to fine-tune.",
-      "privacy_mask_no_regions": "No mask regions yet"
+      "privacy_mask_no_regions": "No mask regions yet",
+      "daynight_mode": "Day / Night Mode",
+      "daynight_auto_hint": "Auto: switches day/night with the light sensor",
+      "infrared_on_hint": "Infrared profile and IR illumination are active",
+      "infrared_off_hint": "Use the daylight profile with IR illumination off",
+      "daynight_auto": "Auto",
+      "daynight_day": "Day",
+      "daynight_night": "Night",
+      "light_thresholds": "Light thresholds (auto)",
+      "night_enter": "Enter night ≤",
+      "day_enter": "Enter day ≥"
     },
     "media_player": {
       "bitrate": "Bitrate",
@@ -1103,34 +1119,6 @@
       "reconnecting": "Reconnecting...",
       "max_retries_reached": "Max retries reached. Click to reconnect."
     },
-    "ssh": {
-      "permit_root_login": "Root Login",
-      "port_invalid": "Port must be between 1 and 65535",
-      "permit_root": {
-        "yes": "Allow",
-        "prohibit_password": "Key Only",
-        "no": "Deny"
-      },
-      "password_authentication": "Password Authentication",
-      "pubkey_authentication": "Public Key Authentication",
-      "auth": {
-        "enabled": "Enabled",
-        "disabled": "Disabled"
-      },
-      "max_auth_tries": "Max Authentication Tries",
-      "max_auth_tries_invalid": "Max authentication tries must be between 1 and 10",
-      "restart_service": "Restart SSH service after saving",
-      "logs": "SSH Logs",
-      "no_logs": "No logs available",
-      "status": {
-        "active": "Running",
-        "inactive": "Stopped",
-        "unknown": "Unknown"
-      },
-      "update_success": "SSH configuration updated successfully",
-      "update_error": "Failed to update SSH configuration: ",
-      "logs_refreshed": "Logs refreshed"
-    },
     "file_management": {
       "title": "File Management",
       "search_placeholder": "Search files...",
@@ -1207,12 +1195,25 @@
       "confirm_save_description": "Are you sure you want to save changes? This will overwrite the original file.",
       "forward": "Forward",
       "select_all": "Select All",
-      "up": "Up"
+      "up": "Up",
+      "preparing_zip": "Packaging {{count}} files...",
+      "download_complete": "Successfully downloaded {{count}} files",
+      "batch_download_failed": "Batch download failed",
+      "deleting": "Deleting...",
+      "confirm_delete": "Confirm Delete",
+      "batch_delete_confirm": "Batch Delete Confirmation",
+      "batch_delete_warning": "Are you sure you want to delete {{count}} selected files/folders? This cannot be undone."
     },
     "file_upload": {
       "uploading": "Uploading...",
       "add_more_files": "Click or drag to add more files",
-      "placeholder": "Drag files here, or click to select"
+      "placeholder": "Drag files here, or click to select",
+      "file_too_large": "File too large; maximum allowed {{limit}}",
+      "no_limit": "Unlimited",
+      "file_type_unsupported": "Unsupported file type",
+      "select_file": "Select File",
+      "upload_image_hint": "Click or drag to upload an image",
+      "image_formats_hint": "Supports PNG, JPG, GIF, WebP"
     },
     "apps": {
       "title": "Applications",
@@ -1291,7 +1292,10 @@
         "resource_load": "Resource Load",
         "since_last_hour": "since last hour",
         "stability_index": "Overall stability index",
-        "optimal_allocation": "Optimal allocation active"
+        "optimal_allocation": "Optimal allocation active",
+        "cpu": "CPU",
+        "memory": "Memory",
+        "uptime": "Uptime"
       },
       "permissions": {
         "events": "Events"
@@ -1303,7 +1307,9 @@
         "device": "Device Control",
         "network": "Network",
         "light": "Light",
-        "lens": "Lens"
+        "lens": "Lens",
+        "video": "Video Streams",
+        "models": "AI Models"
       },
       "import": {
         "wizard_title": "Application Setup Wizard",
@@ -1361,8 +1367,6 @@
         "yaml_copied": "Copied to clipboard",
         "yaml_copy_failed": "Copy failed",
         "yaml_preview_hint": "Read-only preview · generated from the form — copy and use as app.yaml",
-        "yaml_edited_review": "app.yaml: modified in the YAML editor (installed as edited)",
-        "yaml_review_unchanged": "app.yaml: unmodified",
         "yaml_loading": "Loading editor…",
         "image_address": "Image Address",
         "app_id": "Application ID *",
@@ -1553,7 +1557,15 @@
         "website": "Official Website",
         "docs": "Documentation",
         "version_history": "Version History",
-        "release_date": "Release Date"
+        "release_date": "Release Date",
+        "permissions": "Permissions & Resources",
+        "info": "App Info",
+        "id": "ID",
+        "version": "Version",
+        "installed_at": "Installed At",
+        "started_at": "Started At",
+        "fetch_failed": "Failed to load app details",
+        "missing_manifest": "App is missing manifest_path information"
       },
       "terminal": {
         "title": "Container Terminal"
@@ -1922,7 +1934,14 @@
         "ir_led_on": "ON",
         "ir_led_off": "OFF",
         "set_success": "Setting updated",
-        "set_failed": "Failed to update setting"
+        "set_failed": "Failed to update setting",
+        "preset_name_prompt": "Preset name",
+        "preset_saved": "Preset saved",
+        "preset_loaded": "Preset loaded",
+        "presets": "Presets",
+        "save_preset": "Save current",
+        "no_presets": "No presets saved",
+        "load": "Load"
       },
       "lens": {
         "title": "Lens Control",
