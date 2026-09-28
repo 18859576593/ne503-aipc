@@ -67,10 +67,20 @@ jobs:
             AIPC_MIN_OS_VERSION="$AIPC_MIN_OS_VERSION" \
             AIPC_MAX_OS_VERSION="$AIPC_MAX_OS_VERSION"
 
+      - name: Resolve artifact version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          RAW="${VERSION_INPUT:-${GITHUB_REF_NAME}}"
+          RAW="${RAW##*/}"   # release/v1.1.0 -> v1.1.0 (artifact names must not contain '/')
+          RAW="${RAW#v}"     # normalize to exactly one leading 'v'
+          echo "FIRMWARE_VERSION=v${RAW}" >> "$GITHUB_ENV"
+
       - name: Upload firmware package
         uses: actions/upload-artifact@v4
         with:
-          name: hailo-firmware
+          name: neoruntime-hailo-firmware-${{ env.FIRMWARE_VERSION }}
           path: build/release/neoruntime-hailo15-*.tar.gz
 
       - name: Publish GitHub release
