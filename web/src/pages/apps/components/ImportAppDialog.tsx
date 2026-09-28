@@ -7,6 +7,7 @@ import {
   useState,
   useEffect,
 } from 'react';
+import axios from 'axios';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -163,6 +164,10 @@ export default function ImportAppDialog({
   const [yamlMounted, setYamlMounted] = useState(false);
 
   const cancelRequestedRef = useRef(false);
+  // In-flight upload request, if any. Aborted on wizard cancel/close so a
+  // zombie request cannot keep driving the progress bar (or fight a newer
+  // upload) after the dialog is closed and reopened.
+  const uploadAbortRef = useRef<AbortController | null>(null);
   // snapshot of the config hydrated from the uploaded manifest; dirty
   // checks and the PATCH body diff against it.
   const hydratedConfigRef = useRef<WizardConfig | null>(null);
@@ -277,6 +282,11 @@ export default function ImportAppDialog({
   }, [manifestPath, imageTarPath]);
 
   const resetWizardState = () => {
+    // Kill any in-flight upload first: its progress callbacks and finally
+    // reset must never leak past a cancel/close into a reopened dialog.
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+
     setPage('source');
     setSourceType('local');
     setConfig({ ...defaultConfig });
@@ -399,6 +409,11 @@ export default function ImportAppDialog({
       return;
     }
 
+    // Close without the wizard cancel path (e.g. parent-driven): abort any
+    // in-flight upload the same way resetWizardState does.
+    uploadAbortRef.current?.abort();
+    uploadAbortRef.current = null;
+
     setPage('source');
     setSourceType('local');
     setConfig({ ...defaultConfig });
@@ -439,10 +454,19 @@ export default function ImportAppDialog({
   // slots) vs bare image tar (the form below generates the manifest) ----
 
   const handlePackageUpload = async (file: File) => {
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     setIsUploadingLocal(true);
     setLocalProgress(0);
     try {
-      const res = await appsApi.uploadPackage(file, p => setLocalProgress(p));
+      const res = await appsApi.uploadPackage(
+        file,
+        p => {
+          // A stale run's events must not fight a newer upload's bar.
+          if (!controller.signal.aborted) setLocalProgress(p);
+        },
+        controller.signal
+      );
       const data = res?.data;
       if (data?.path && data?.image_path) {
         if (cancelRequestedRef.current) {
@@ -471,21 +495,38 @@ export default function ImportAppDialog({
         });
       }
     } catch (err: unknown) {
+      // Wizard cancel aborted the request — the cancel path already reset
+      // the UI; don't surface it as an upload failure.
+      if (axios.isCancel(err)) return;
       toast.error(
         resolveInstallApiError(err, t)
           || t('sys.apps.import.package_upload_failed', 'Package upload failed')
       );
     } finally {
-      setIsUploadingLocal(false);
-      setLocalProgress(0);
+      // Only the latest run owns the upload slot: an older run settling
+      // after a new upload began must not zero the new progress bar.
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+        setIsUploadingLocal(false);
+        setLocalProgress(0);
+      }
     }
   };
 
   const handleImageUpload = async (file: File) => {
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     setIsUploadingLocal(true);
     setLocalProgress(0);
     try {
-      const res = await appsApi.uploadImage(file, p => setLocalProgress(p));
+      const res = await appsApi.uploadImage(
+        file,
+        p => {
+          // A stale run's events must not fight a newer upload's bar.
+          if (!controller.signal.aborted) setLocalProgress(p);
+        },
+        controller.signal
+      );
       const data = res?.data;
       if (!data?.path) {
         throw new Error(
@@ -506,13 +547,21 @@ export default function ImportAppDialog({
         size: data.size ?? file.size,
       });
     } catch (err: unknown) {
+      // Wizard cancel aborted the request — the cancel path already reset
+      // the UI; don't surface it as an upload failure.
+      if (axios.isCancel(err)) return;
       toast.error(
         resolveInstallApiError(err, t)
           || t('sys.apps.import.image_upload_failed', '镜像上传失败')
       );
     } finally {
-      setIsUploadingLocal(false);
-      setLocalProgress(0);
+      // Only the latest run owns the upload slot: an older run settling
+      // after a new upload began must not zero the new progress bar.
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+        setIsUploadingLocal(false);
+        setLocalProgress(0);
+      }
     }
   };
 

@@ -240,6 +240,11 @@ request.interceptors.response.use(
     return response;
   },
   error => {
+    // AbortController-driven cancellation is caller-initiated; reject
+    // silently instead of surfacing it as a network-error toast.
+    if (axios.isCancel(error)) {
+      return Promise.reject(error);
+    }
     if (!error.response) {
       const config = error.config as
         | { url?: string; silent?: boolean }

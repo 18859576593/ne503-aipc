@@ -41,8 +41,12 @@ export const appsApi = {
   // 获取异步安装进度
   getInstallProgress: (taskId: string) => request.get(`/api/v1/apps/install-progress/${taskId}`),
 
-  // 上传镜像文件
-  uploadImage: (file: File, onProgress?: (progress: number) => void) => {
+  // 上传镜像文件（signal：向导取消时中止请求，防止残留上传继续回调）
+  uploadImage: (
+    file: File,
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
+  ) => {
     const formData = new FormData();
     formData.append('file', file); // 字段名必须是 'file'
 
@@ -50,6 +54,7 @@ export const appsApi = {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      signal,
       onUploadProgress: progressEvent => {
         if (onProgress && progressEvent.total) {
           const percentCompleted = Math.round(
@@ -72,7 +77,12 @@ export const appsApi = {
 
   // 上传 .neoapp 单文件应用包（tar.gz：app.yaml + image.tar），服务端解包，
   // 响应同时携带 manifest 与 image 两半（path/image_path 等）
-  uploadPackage: (file: File, onProgress?: (progress: number) => void) => {
+  // （signal：向导取消时中止请求，防止残留上传继续回调）
+  uploadPackage: (
+    file: File,
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal
+  ) => {
     const formData = new FormData();
     formData.append('file', file); // 字段名必须是 'file'
 
@@ -80,6 +90,7 @@ export const appsApi = {
       headers: {
         'Content-Type': 'multipart/form-data',
       },
+      signal,
       onUploadProgress: progressEvent => {
         if (onProgress && progressEvent.total) {
           const percentCompleted = Math.round(
