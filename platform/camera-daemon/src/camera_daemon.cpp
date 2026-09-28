@@ -6208,7 +6208,9 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
         // stable. Publisher streams are keyed by config name — the encoder
         // output callback translates media names back to it.
         EncodedPublisher::StreamDropStats ds{};
-        if (encoded_pub_ && encoded_pub_->get_stream_stats(ec.stream_name, &ds)) {
+        bool have_ds = encoded_pub_ &&
+            encoded_pub_->get_stream_stats(ec.stream_name, &ds);
+        if (have_ds) {
             info->set_packets_published(ds.packets_published);
             info->set_queue_overflow_drops(ds.queue_overflow_drops);
             info->set_client_send_drops(ds.client_send_drops);
@@ -6255,6 +6257,34 @@ void CameraDaemon::get_stream_status(aipc::camera::GetStreamStatusResponse& resp
             // spinning up (typical right after a profile switch).
             info->set_status("starting");
             info->set_status_detail("waiting for first encoded frame");
+        } else if (have_ds && ds.packets_published >= EncodedPublisher::kHealthMinPktsNoIdr &&
+                   (ds.keyframes_published == 0 ||
+                    ds.last_keyframe_ms > 0)) {
+            // Dual-signal metadata-only verdict (mirrors the publisher's
+            // encoder-health alarm): packets flow but no keyframe was ever
+            // coded AND average packet size is metadata-like (~165B), or IDRs
+            // stopped >90s ago while packets keep flowing. Either way "active"
+            // would lie to the UI — the socket delivers data a decoder can
+            // never initialize from.
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const bool no_kf_ever =
+                ds.keyframes_published == 0 &&
+                ds.bytes_published / ds.packets_published <
+                    EncodedPublisher::kHealthMinAvgBytes;
+            const bool idr_stopped =
+                ds.keyframes_published > 0 &&
+                now_ms - ds.last_keyframe_ms > EncodedPublisher::kHealthMaxIdrGapMs;
+            if (no_kf_ever || idr_stopped) {
+                info->set_status("degraded");
+                info->set_status_detail(
+                    idr_stopped && !no_kf_ever
+                        ? "metadata-only: no keyframe for " +
+                          std::to_string((now_ms - ds.last_keyframe_ms) / 1000) + "s"
+                        : "metadata-only: packets flow but no keyframe ever coded");
+            } else {
+                info->set_status("active");
+            }
         } else {
             info->set_status("active");
         }
@@ -7405,11 +7435,32 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         }
 
         if (!verified) {
-            HAL_LOG_ERROR(
-                "CameraDaemon: post-switch frame verify FAILED for '%s' "
-                "(no frames on '%s' within %ums); rolling back to '%s'",
-                profile_name.c_str(), primary_stream.c_str(),
-                kVerifyBudgetMs, prev_profile.c_str());
+            // Discriminate the failure mode for the operator: packets still
+            // flowing means the encoder is emitting metadata-only (~165B SEI)
+            // and coding no video — encoder buffer starvation, observed with
+            // kernel CMA fragmentation. The rollback recycle usually does NOT
+            // help that class; a device reboot is the known remedy. The window
+            // is tight (not seconds): a metadata-only stream emits 15-30
+            // packets/s, so packet gaps stay ≤~100ms — a wider window would
+            // misclassify a stream that died outright as metadata-only.
+            const bool packets_flowing =
+                encoder_mgr_->seen_first_packet(primary_stream) &&
+                encoder_mgr_->ms_since_last_packet(primary_stream) < 1500;
+            if (packets_flowing) {
+                HAL_LOG_ERROR(
+                    "CameraDaemon: post-switch verify FAILED on '%s' with "
+                    "packets flowing but NO keyframe — metadata-only encoder "
+                    "output (buffer starvation suspected; check 'dmesg | grep "
+                    "cma_alloc' for ret: -12; rollback recycle may not help, "
+                    "device reboot is the known remedy); rolling back to '%s'",
+                    primary_stream.c_str(), prev_profile.c_str());
+            } else {
+                HAL_LOG_ERROR(
+                    "CameraDaemon: post-switch frame verify FAILED for '%s' "
+                    "(no frames on '%s' within %ums); rolling back to '%s'",
+                    profile_name.c_str(), primary_stream.c_str(),
+                    kVerifyBudgetMs, prev_profile.c_str());
+            }
 
             // Stop consumers before the rollback HAL switch, mirroring the
             // forward flow: switch_profile restarts the pipeline internally and
@@ -7467,15 +7518,21 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
             }
 
             if (message) {
+                // packets_flowing branch = metadata-only syndrome: say what an
+                // operator can act on (no coded video, not "no frames").
+                const char* what = packets_flowing
+                    ? "' produced no coded video (metadata-only packets, no "
+                      "keyframe) within "
+                    : "' produced no video frames within ";
                 if (!rolled_back) {
-                    *message = "profile '" + profile_name + "' produced no video frames within " +
+                    *message = "profile '" + profile_name + what +
                                std::to_string(kVerifyBudgetMs / 1000) + "s";
                 } else if (rb_verified) {
-                    *message = "profile '" + profile_name + "' produced no video frames within " +
+                    *message = "profile '" + profile_name + what +
                                std::to_string(kVerifyBudgetMs / 1000) +
                                "s; rolled back to '" + prev_profile + "'";
                 } else {
-                    *message = "profile '" + profile_name + "' produced no video frames within " +
+                    *message = "profile '" + profile_name + what +
                                std::to_string(kVerifyBudgetMs / 1000) + "s; rolled back to '" +
                                prev_profile + "' but it is also producing no frames; "
                                "pipeline may need a manual restart";
@@ -7502,8 +7559,10 @@ bool CameraDaemon::verify_primary_stream_frames(uint64_t budget_ms, std::string*
 
     // Resolve the primary stream (first configured encoder → media name).
     std::string primary_stream;
+    std::string primary_cfg_name;  // publisher stats are keyed by CONFIG name
     if (!config_.encoders.empty()) {
-        primary_stream = config_.encoders.front().stream_name;
+        primary_cfg_name = config_.encoders.front().stream_name;
+        primary_stream = primary_cfg_name;
         for (const auto& [media_name, config_name] : encoder_name_map_) {
             if (config_name == primary_stream) {
                 primary_stream = media_name;
@@ -7520,11 +7579,56 @@ bool CameraDaemon::verify_primary_stream_frames(uint64_t budget_ms, std::string*
         return true;
     }
 
+    // Content check baseline: a fresh-packet check alone was fooled on
+    // 2026-09-28 (67.251) — an encoder starved of DMA buffers by kernel CMA
+    // fragmentation emits 30fps of ~165B SEI metadata packets and ZERO coded
+    // video, yet packet presence read as "frames flowing". The first coded
+    // frame of an encoder is always an IDR, so demanding one keyframe over the
+    // baseline adds ~zero latency on a healthy encoder. Fall back to the old
+    // packet-only verdict when publisher introspection is unavailable — a
+    // switch must never be blocked by a missing stats path.
+    EncodedPublisher::StreamDropStats st_base{};
+    const bool have_base = encoded_pub_ &&
+        encoded_pub_->get_stream_stats(primary_cfg_name, &st_base);
+
+    // v2 FROM_MEDIA encoders expose no force-IDR (EncoderManager::force_keyframe
+    // is a no-op stub), and the encoder's first post-switch IDR is usually
+    // emitted — and dropped by the stopped publisher — before this point, so a
+    // keyframe-only requirement would be GOP-bound and could falsely fail a
+    // healthy long-GOP encoder. The pass condition below is therefore
+    // dual-signal: a keyframe since baseline, OR packets averaging real coded
+    // sizes since baseline. Metadata-only output (SEI/SPS/PPS, ~165B/packet)
+    // fails both; healthy P-frame flow (~KBs) passes on the first polls.
+    constexpr uint64_t kCodedFrameMinAvgBytes = 512;
+
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         if (encoder_mgr_->seen_first_packet(primary_stream) &&
             encoder_mgr_->ms_since_last_packet(primary_stream) < kVerifyFreshMs) {
-            return true;
+            if (!have_base) return true;  // no introspection → packet-only verdict
+            EncodedPublisher::StreamDropStats st{};
+            if (!encoded_pub_->get_stream_stats(primary_cfg_name, &st)) {
+                // Entry vanished mid-verify (stream recreated under us). Don't
+                // spin on a gone entry — retry the lookup next poll.
+                std::this_thread::sleep_for(std::chrono::milliseconds(kVerifyPollMs));
+                continue;
+            }
+            if (st.packets_published < st_base.packets_published) {
+                // Stream was recreated under us (packets_published resets with
+                // the StreamState; the seq space persists). A keyframe already
+                // coded by the fresh entry is post-recreation evidence;
+                // otherwise re-baseline — the old counters belong to a dead
+                // entry and would poison every comparison after this poll.
+                if (st.keyframes_published > 0) return true;
+                st_base = st;
+            }
+            if (st.keyframes_published > st_base.keyframes_published) return true;
+            const uint64_t d_pkts  = st.packets_published - st_base.packets_published;
+            const uint64_t d_bytes = st.bytes_published - st_base.bytes_published;
+            if (d_pkts > 0 && d_bytes / d_pkts >= kCodedFrameMinAvgBytes) return true;
+            // Fresh packets, but neither a keyframe nor coded-size payloads
+            // since the baseline — keep polling until budget; the
+            // metadata-only syndrome fails here.
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(kVerifyPollMs));
     }
