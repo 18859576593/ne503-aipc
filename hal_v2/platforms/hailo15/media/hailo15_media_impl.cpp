@@ -2458,6 +2458,49 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
     return cfg.dump(2);
 }
 
+/* Snapshot each profile's authored iq_settings.grayscale.enabled. Must run
+ * exactly once, at FIRST init: only there is no runtime override applied yet,
+ * so get_profile() still returns the values parsed from the immutable
+ * configuration. (Profiles in the stock webserver config are name+config_file
+ * stubs — iq_settings live in per-profile files — so the values are read
+ * through the SDK rather than re-parsed from the config json. This also stays
+ * correct for custom config_path/config_json and non-default IR profiles
+ * configured in camera-daemon.) */
+static void snapshot_authored_grayscale(Hailo15MediaPriv *priv)
+{
+    priv->authored_profile_grayscale.clear();
+    for (const std::string &name : priv->profile_names)
+    {
+        auto exp = priv->media_lib->get_profile(name);
+        if (!exp.has_value())
+        {
+            HAL_LOG_WARNING("hailo15_media: snapshot_authored_grayscale: get_profile('%s') failed",
+                            name.c_str());
+            continue;
+        }
+        priv->authored_profile_grayscale[name] = exp.value().iq_settings.grayscale.enabled;
+    }
+}
+
+/* The live profile's iq_settings.grayscale.enabled is not a safe source for
+ * "is this profile monochrome by design": set_override_parameters() ->
+ * ConfigManager::set_profile() replaces the stored profile_by_name entry with
+ * the toggled values, so after a single gray=1 toggle the live value stays
+ * true until reboot re-parses the JSON (the grayscale ratchet). Consult the
+ * init-time snapshot instead (see snapshot_authored_grayscale). Unknown
+ * profile names fall back to color with a warning. */
+static bool profile_authored_grayscale(Hailo15MediaPriv *priv, const std::string &profile_name)
+{
+    const auto it = priv->authored_profile_grayscale.find(profile_name);
+    if (it == priv->authored_profile_grayscale.end())
+    {
+        HAL_LOG_WARNING("hailo15_media: no authored grayscale snapshot for '%s' - assuming color",
+                        profile_name.c_str());
+        return false;
+    }
+    return it->second;
+}
+
 /**
  * Full MediaLibrary teardown + reinit for stream layout changes (add/remove).
  * Patches the stored config JSON to match the target stream layout, then
@@ -2698,6 +2741,10 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
     }
 
     hailo15_parse_profile_names_from_config_json(json, &priv->profile_names);
+    /* First init only: capture each profile's authored grayscale before any runtime
+     * override can replace the stored entries (see snapshot_authored_grayscale).
+     * The snapshot lives in priv and survives later media_lib reinits unchanged. */
+    snapshot_authored_grayscale(priv);
 
     auto *hm = static_cast<HalMediaContext *>(calloc(1, sizeof(HalMediaContext)));
     if (!hm)
@@ -4230,21 +4277,6 @@ static std::string patch_config_json_for_rotation(
     return cfg.dump();
 }
 
-/* Authored-intrinsic grayscale: only the Infrared-family profiles ship with
- * grayscale=true in their iq_settings (Infrared_Basic -> AF_IR,
- * Infrared_Basic_FG2009 -> gst_example_IR); every Daylight-family profile is
- * authored color. The LIVE profile must never be consulted for this:
- * set_override_parameters() -> ConfigManager::set_profile() replaces the stored
- * profile_by_name entry with the toggled values, so after a single gray=1
- * toggle the live iq_settings.grayscale.enabled reads true until reboot
- * re-parses the JSON — and `toggle || live` could never turn grayscale off
- * again (the grayscale ratchet). Derive it from identity (the profile name)
- * instead of mutable state. */
-static bool profile_intrinsic_grayscale(const config_profile_t &p)
-{
-    return p.name.rfind("Infrared", 0) == 0;
-}
-
 /**
  * Full medialib shutdown + reinitialize for rotation transitions on large resolutions.
  *
@@ -4512,11 +4544,11 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
             p.stabilizer_settings.eis.enabled = cfg->eis;
             /* Profile-intrinsic grayscale (IR monochrome) must survive a full reinit:
              * the toggle may only add grayscale, never remove it (see dynamic_change_image_config). */
-            const bool intrinsic_gray = profile_intrinsic_grayscale(p);
+            const bool intrinsic_gray = profile_authored_grayscale(priv, p.name);
             if (intrinsic_gray && !cfg->grayscale)
             {
-                HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is an "
-                             "infrared (intrinsic monochrome) profile",
+                HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is authored "
+                             "monochrome",
                              p.name.c_str());
             }
             p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
@@ -4717,20 +4749,21 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     p.iq_settings.dewarp.enabled = cfg->dewarp;
     p.stabilizer_settings.dis.enabled = cfg->dis;
     p.stabilizer_settings.eis.enabled = cfg->eis;
-    /* A profile that mandates monochrome (the Infrared family) must keep
-     * grayscale ON; the transform toggle may only ADD grayscale, never disable a
-     * profile-intrinsic one. Otherwise flipping / resolution-switching in IR mode
+    /* A profile authored monochrome (the Infrared family) must keep
+     * grayscale ON; the transform toggle may only ADD grayscale, never disable an
+     * authored one. Otherwise flipping / resolution-switching in IR mode
      * clobbers the B&W output into a purple color cast (IR-cut at night + IR LEDs +
      * AWB on a color path). NOTE: the live profile value must not be OR-ed here —
      * set_override_parameters() writes toggled values back into the stored profile,
      * so after one gray=1 toggle the live value stays true until reboot and the
-     * toggle can never turn grayscale off again (the grayscale ratchet). Identity
-     * (the profile name) is the only contamination-free source. */
-    const bool intrinsic_gray = profile_intrinsic_grayscale(p);
+     * toggle can never turn grayscale off again (the grayscale ratchet). The
+     * init-time authored snapshot (profile_authored_grayscale) is the only
+     * contamination-free source. */
+    const bool intrinsic_gray = profile_authored_grayscale(priv, p.name);
     if (intrinsic_gray && !cfg->grayscale)
     {
-        HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is an "
-                     "infrared (intrinsic monochrome) profile",
+        HAL_LOG_INFO("hailo15_media: grayscale toggle-off ignored - '%s' is authored "
+                     "monochrome",
                      p.name.c_str());
     }
     p.iq_settings.grayscale.enabled = cfg->grayscale || intrinsic_gray;
