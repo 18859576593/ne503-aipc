@@ -2512,6 +2512,10 @@ static bool profile_authored_grayscale(Hailo15MediaPriv *priv, const std::string
 
 extern "C" {
 
+/* Forward declaration — defined near rotation_full_reinit(), which shares it. */
+static std::string patch_rotation_in_profile_files(const std::string &config_json,
+                                                   rotation_angle_t angle);
+
 static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_return)
 {
     if (!config || !media_ctx_return)
@@ -2611,6 +2615,24 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
     else
     {
         fix_encoder_dimension_mismatches(json);
+    }
+
+    /* Bake the caller-requested rotation into the initial medialib build.
+     * Rotation is the only image field whose later change forces a medialib
+     * pipeline restart (stream_restart_required() in the vendor lib), and that
+     * internal stop→reconfigure→start can wedge the DSP rotation buffers (see
+     * dynamic_change_image_config). Patching the rotation into the profile
+     * files BEFORE initialize() means the pipeline is CREATED rotated, so the
+     * caller's post-init transform replay is rotation-wise a no-op — no
+     * restart, no wedge, no slow full reinit at boot. Other image fields
+     * (flip/dewarp/gray/dis/eis) do not trigger restarts and are applied by
+     * the normal dynamic_change_image_config() path after init. */
+    if (config->image_config.rotation_angle != HAL_ROTATION_ANGLE_0)
+    {
+        HAL_LOG_INFO("hailo15_media: init: baking rotation=%d into initial pipeline build",
+                     static_cast<int>(config->image_config.rotation_angle));
+        json = patch_rotation_in_profile_files(
+            json, static_cast<rotation_angle_t>(config->image_config.rotation_angle));
     }
 
     /* Re-sync stored_config_json now that encoder overrides / dimension fixes have
@@ -2790,6 +2812,13 @@ static int hailo15_media_init(const HalMediaConfig *config, void **media_ctx_ret
             const auto &iq = prof_exp.value().iq_settings;
             hm->config.image_config.dewarp = iq.dewarp.enabled;
             hm->config.image_config.grayscale = iq.grayscale.enabled;
+            /* Rotation too — the profile may carry a rotation baked at init
+             * (image_config above) or authored in the config JSON. Reporting
+             * it keeps get_current_config() truthful and lets callers detect
+             * "already rotated" instead of issuing a redundant rotation
+             * change (which would take the slow full-reinit path). */
+            hm->config.image_config.rotation_angle = static_cast<HalRotationAngle>(
+                prof_exp.value().application_settings.rotation.effective_value());
         }
     }
 
@@ -4295,6 +4324,143 @@ static std::string patch_config_json_for_rotation(
  * The pipeline starts directly in the rotated configuration, avoiding any stop→restart
  * buffer reallocation.
  */
+/* Patch the rotation into every profile file referenced by a medialib config
+ * JSON (profiles[].config_file → application_settings, whether string-referenced
+ * or inline), recomputing the medialib content hashes so the edited files stay
+ * valid. String-referenced application_settings are redirected to a patched
+ * copy under /tmp; inline objects and profile files are patched in place.
+ *
+ * Shared by rotation_full_reinit() (runtime rotation change) and
+ * hailo15_media_init() (baking the persisted rotation into the initial build)
+ * — both need the pipeline to be CREATED with the rotation already in the
+ * profile files, because changing rotation on a built pipeline goes through
+ * medialib's internal stop→reconfigure→start(), which is the wedge path
+ * (see dynamic_change_image_config).
+ *
+ * The main config JSON itself is only canonically re-dumped; all edits land in
+ * the referenced profile files. Returns the (re-dumped) config JSON. */
+static std::string patch_rotation_in_profile_files(const std::string &config_json,
+                                                   rotation_angle_t angle)
+{
+    using json = nlohmann::json;
+    std::string patched_json = config_json;
+    json cfg;
+    try { cfg = json::parse(patched_json); } catch (...) {}
+
+    if (cfg.is_discarded() || !cfg.contains("profiles") || !cfg["profiles"].is_array())
+    {
+        return patched_json;
+    }
+
+    /* Helper: patch application_settings content. Do NOT swap
+     * application_input_streams resolutions — multi_resize's
+     * get_output_resolution_by_index() already swaps dimensions when rotation
+     * is 90/270. Swapping here too causes a double-swap that negates the
+     * rotation. */
+    auto patch_app_settings = [&](json &app_obj) {
+        if (!app_obj.contains("rotation")) app_obj["rotation"] = json::object();
+        app_obj["rotation"]["enabled"] = (angle != ROTATION_ANGLE_0);
+        {
+            const char *angle_str = "ROTATION_ANGLE_0";
+            switch (angle) {
+                case ROTATION_ANGLE_90:  angle_str = "ROTATION_ANGLE_90"; break;
+                case ROTATION_ANGLE_180: angle_str = "ROTATION_ANGLE_180"; break;
+                case ROTATION_ANGLE_270: angle_str = "ROTATION_ANGLE_270"; break;
+                default: break;
+            }
+            app_obj["rotation"]["angle"] = angle_str;
+        }
+    };
+
+    for (auto &prof : cfg["profiles"])
+    {
+        if (!prof.contains("config_file") || !prof["config_file"].is_string())
+            continue;
+        std::string pf_path = prof["config_file"].get<std::string>();
+        std::ifstream pf(pf_path);
+        if (!pf.is_open()) continue;
+        json pf_data;
+        try { pf >> pf_data; } catch (...) { pf.close(); continue; }
+        pf.close();
+
+        bool changed = false;
+        if (pf_data.contains("application_settings"))
+        {
+            if (pf_data["application_settings"].is_string())
+            {
+                std::string as_path = pf_data["application_settings"].get<std::string>();
+                std::ifstream asf(as_path);
+                if (asf.is_open())
+                {
+                    json as_data;
+                    try { asf >> as_data; } catch (...) { asf.close(); continue; }
+                    asf.close();
+                    patch_app_settings(as_data);
+                    if (as_data.contains("metadata") && as_data["metadata"].is_object())
+                    {
+                        auto h = compute_medialib_content_hash(as_data);
+                        if (h) as_data["metadata"]["content_hash"] = *h;
+                    }
+                    std::string basename = pf_path;
+                    auto slash = basename.rfind('/');
+                    if (slash != std::string::npos) basename = basename.substr(slash + 1);
+                    auto dot = basename.rfind('.');
+                    if (dot != std::string::npos) basename = basename.substr(0, dot);
+                    std::string tmp_as = "/tmp/app_settings_rot_" + basename + ".json";
+                    std::ofstream of(tmp_as);
+                    if (of.is_open())
+                    {
+                        of << as_data.dump(4);
+                        of.close();
+                        pf_data["application_settings"] = tmp_as;
+                        changed = true;
+                    }
+                    else
+                    {
+                        HAL_LOG_WARNING("hailo15_media: patch_rotation_in_profile_files: "
+                                        "cannot write %s (rotation not baked for this profile)",
+                                        tmp_as.c_str());
+                    }
+                }
+            }
+            else if (pf_data["application_settings"].is_object())
+            {
+                patch_app_settings(pf_data["application_settings"]);
+                if (pf_data["application_settings"].contains("metadata") &&
+                    pf_data["application_settings"]["metadata"].is_object())
+                {
+                    auto h = compute_medialib_content_hash(pf_data["application_settings"]);
+                    if (h) pf_data["application_settings"]["metadata"]["content_hash"] = *h;
+                }
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            if (pf_data.contains("metadata") && pf_data["metadata"].is_object())
+            {
+                auto h = compute_medialib_content_hash(pf_data);
+                if (h) pf_data["metadata"]["content_hash"] = *h;
+            }
+            std::ofstream of(pf_path);
+            if (of.is_open())
+            {
+                of << pf_data.dump(4);
+                of.close();
+                HAL_LOG_INFO("hailo15_media: patch_rotation_in_profile_files: patched profile %s (rotation only, no encoder swap)",
+                             pf_path.c_str());
+            }
+            else
+            {
+                HAL_LOG_WARNING("hailo15_media: patch_rotation_in_profile_files: "
+                                "cannot write profile %s (rotation not baked)",
+                                pf_path.c_str());
+            }
+        }
+    }
+    return cfg.dump(4);
+}
+
 static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15MediaPriv *priv,
                                 const HalMediaImageConfig *cfg)
 {
@@ -4319,110 +4485,7 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
      * The encoder input_stream dimensions must remain UN-rotated so that the
      * appsrc caps match the DSP output format.  Only Pass B is needed:
      * set rotation enabled/angle and swap application_input_streams resolutions. */
-    {
-        using json = nlohmann::json;
-        json cfg;
-        try { cfg = json::parse(patched_json); } catch (...) {}
-
-        if (!cfg.is_discarded() && cfg.contains("profiles") && cfg["profiles"].is_array())
-        {
-            /* Helper: patch application_settings content */
-            auto patch_app_settings = [&](json &app_obj) {
-                if (!app_obj.contains("rotation")) app_obj["rotation"] = json::object();
-                app_obj["rotation"]["enabled"] = (angle != ROTATION_ANGLE_0);
-                {
-                    const char *angle_str = "ROTATION_ANGLE_0";
-                    switch (angle) {
-                        case ROTATION_ANGLE_90:  angle_str = "ROTATION_ANGLE_90"; break;
-                        case ROTATION_ANGLE_180: angle_str = "ROTATION_ANGLE_180"; break;
-                        case ROTATION_ANGLE_270: angle_str = "ROTATION_ANGLE_270"; break;
-                        default: break;
-                    }
-                    app_obj["rotation"]["angle"] = angle_str;
-                }
-                /* Do NOT swap application_input_streams resolutions here.
-                 * multi_resize's get_output_resolution_by_index() already
-                 * swaps dimensions when rotation is 90/270. Swapping here
-                 * too causes a double-swap that negates the rotation. */
-            };
-
-            for (auto &prof : cfg["profiles"])
-            {
-                if (!prof.contains("config_file") || !prof["config_file"].is_string())
-                    continue;
-                std::string pf_path = prof["config_file"].get<std::string>();
-                std::ifstream pf(pf_path);
-                if (!pf.is_open()) continue;
-                json pf_data;
-                try { pf >> pf_data; } catch (...) { pf.close(); continue; }
-                pf.close();
-
-                bool changed = false;
-                if (pf_data.contains("application_settings"))
-                {
-                    if (pf_data["application_settings"].is_string())
-                    {
-                        std::string as_path = pf_data["application_settings"].get<std::string>();
-                        std::ifstream asf(as_path);
-                        if (asf.is_open())
-                        {
-                            json as_data;
-                            try { asf >> as_data; } catch (...) { asf.close(); continue; }
-                            asf.close();
-                            patch_app_settings(as_data);
-                            if (as_data.contains("metadata") && as_data["metadata"].is_object())
-                            {
-                                auto h = compute_medialib_content_hash(as_data);
-                                if (h) as_data["metadata"]["content_hash"] = *h;
-                            }
-                            std::string basename = pf_path;
-                            auto slash = basename.rfind('/');
-                            if (slash != std::string::npos) basename = basename.substr(slash + 1);
-                            auto dot = basename.rfind('.');
-                            if (dot != std::string::npos) basename = basename.substr(0, dot);
-                            std::string tmp_as = "/tmp/app_settings_rot_" + basename + ".json";
-                            std::ofstream of(tmp_as);
-                            if (of.is_open())
-                            {
-                                of << as_data.dump(4);
-                                of.close();
-                                pf_data["application_settings"] = tmp_as;
-                                changed = true;
-                            }
-                        }
-                    }
-                    else if (pf_data["application_settings"].is_object())
-                    {
-                        patch_app_settings(pf_data["application_settings"]);
-                        if (pf_data["application_settings"].contains("metadata") &&
-                            pf_data["application_settings"]["metadata"].is_object())
-                        {
-                            auto h = compute_medialib_content_hash(pf_data["application_settings"]);
-                            if (h) pf_data["application_settings"]["metadata"]["content_hash"] = *h;
-                        }
-                        changed = true;
-                    }
-                }
-                if (changed)
-                {
-                    if (pf_data.contains("metadata") && pf_data["metadata"].is_object())
-                    {
-                        auto h = compute_medialib_content_hash(pf_data);
-                        if (h) pf_data["metadata"]["content_hash"] = *h;
-                    }
-                    std::ofstream of(pf_path);
-                    if (of.is_open())
-                    {
-                        of << pf_data.dump(4);
-                        of.close();
-                        HAL_LOG_INFO("hailo15_media: rotation_reinit: patched profile %s (rotation only, no encoder swap)",
-                                     pf_path.c_str());
-                    }
-                }
-            }
-            patched_json = cfg.dump(4);
-        }
-    }
+    patched_json = patch_rotation_in_profile_files(patched_json, angle);
 
     /* 3. Disconnect bridge callbacks from old medialib objects. */
     disconnect_ml_bridge_callbacks(priv);
@@ -4632,108 +4695,34 @@ static int hailo15_media_dynamic_change_image_config(void *media_ctx, const HalM
     }
     config_profile_t p = prof_exp.value();
 
-    const bool prev_portrait = is_portrait_rotation(p.application_settings.rotation.effective_value());
-    const bool new_portrait = is_portrait_rotation(static_cast<rotation_angle_t>(cfg->rotation_angle));
+    /* Any real rotation change must take rotation_full_reinit. The light
+     * set_override_parameters() path below makes medialib internally
+     * stop→reconfigure→start() the pipeline, and that internal restart can
+     * silently wedge the multi_resize / DSP output buffer pool: set_override
+     * returns SUCCESS while buffers stop circulating, add_buffer() on the FE
+     * output is rejected and encoders starve → /media black with no signal.
+     * Originally reproduced with a dense DSP stack on dimension-swap rotations
+     * (93.213 — the former dense_dsp_stack / >4096 guards, now subsumed), and
+     * with a bare 180° rotation on medialib v1.12.x (93.214, 2026-09-28: every
+     * boot re-applied persisted rot=180 through this path and wedged, with and
+     * without dewarp/DIS/EIS). rotation_full_reinit bakes the rotation into
+     * the profile files and rebuilds the medialib from a clean state — the
+     * same known-good path the BUFFER_ALLOCATION_ERROR fallback below already
+     * uses. Cost: a few seconds of rebuild for a rare, user-initiated
+     * orientation change; every other image field (flip/dewarp/gray/dis/eis)
+     * still takes the fast in-place path because medialib does not restart
+     * the pipeline for those. */
+    if (p.application_settings.rotation.effective_value() !=
+        static_cast<rotation_angle_t>(cfg->rotation_angle))
+    {
+        HAL_LOG_INFO("hailo15_media: rotation change (%d -> %d): using rotation_full_reinit",
+                     static_cast<int>(p.application_settings.rotation.effective_value()),
+                     static_cast<int>(cfg->rotation_angle));
+        return rotation_full_reinit(media_ctx, hm, priv, cfg);
+    }
 
     p.application_settings.rotation.enabled = (cfg->rotation_angle != HAL_ROTATION_ANGLE_0);
     p.application_settings.rotation.angle = static_cast<rotation_angle_t>(cfg->rotation_angle);
-
-    /* Swap encoder width/height when transitioning between landscape and portrait.
-     * This matches the Hailo rotation_example pattern — medialib's internal
-     * update_encoder_streams_for_rotation() will see that the dimensions already
-     * match the target orientation and skip its own swap, preventing a double-swap.
-     *
-     * For large resolutions (any dimension > 2688), the normal set_override_parameters()
-     * path often fails due to CMA DMA buffer fragmentation — the medialib pipeline restart
-     * (stop→start) doesn't release enough CMA for the larger rotated buffer pools.
-     * In that case we fall back to a full medialib shutdown/reinitialize cycle which
-     * releases ALL DMA resources before allocating the rotated pipeline from a clean state. */
-    if (prev_portrait != new_portrait)
-    {
-        HAL_LOG_INFO("hailo15_media: rotation transition (prev_portrait=%d, new_portrait=%d), swapping dimensions",
-                     prev_portrait, new_portrait);
-
-        /* Detect large encoders, or a dense DSP transform stack, that need the
-         * full-reinit path. A dimension-swap rotation (we are inside the
-         * prev_portrait != new_portrait branch) layered on top of dewarp + (DIS
-         * or EIS) wedges the in-place set_override_parameters path: the light
-         * medialib stop->restart does not fully tear down the DSP dewarp/DIS/EIS
-         * stages, so they desync with the new geometry -> the FE output callback's
-         * add_buffer() is rejected -> encoder starvation -> /media black screen
-         * (reproduced on 93.213). rotation_full_reinit rebuilds all DSP stages
-         * from a clean medialib and avoids the wedge. Rotation alone (no DSP) is
-         * unaffected and still takes the fast in-place path below. */
-        const bool dense_dsp_stack = (cfg->dewarp && (cfg->dis || cfg->eis));
-        bool needs_full_reinit = dense_dsp_stack;
-        for (auto &kv : p.encoded_output_streams)
-        {
-            uint32_t w = 0, h = 0;
-            std::visit([&](auto &enc) { w = enc.input_stream.width; h = enc.input_stream.height; },
-                       kv.second.encoding);
-            auto pd = priv->encoder_patched_dims.find(kv.first);
-            if (pd != priv->encoder_patched_dims.end())
-            {
-                w = pd->second.first;
-                h = pd->second.second;
-            }
-            // 4K (3840x2160) rotation uses the fast in-place set_override_parameters
-            // path. Verified on 93.72 (2026-08-05): no OOM, no resolution regression.
-            // If a future resolution exceeds 4096, or CMA fragments and the in-place
-            // restart OOMs, the BUFFER_ALLOCATION_ERROR fallback below still recovers
-            // via rotation_full_reinit. Keep 4096 (not the old 2688) so 4K stays fast.
-            if (w > 4096 || h > 4096)
-            {
-                needs_full_reinit = true;
-                break;
-            }
-        }
-
-        if (needs_full_reinit)
-        {
-            return rotation_full_reinit(media_ctx, hm, priv, cfg);
-        }
-
-        for (auto &kv : p.encoded_output_streams)
-        {
-            auto pd = priv->encoder_patched_dims.find(kv.first);
-            if (pd != priv->encoder_patched_dims.end())
-            {
-                uint32_t cw = 0, ch = 0;
-                std::visit([&](auto &enc) { cw = enc.input_stream.width; ch = enc.input_stream.height; },
-                           kv.second.encoding);
-                if (cw != pd->second.first || ch != pd->second.second)
-                {
-                    HAL_LOG_INFO("hailo15_media: rotation: correcting encoder '%s' from profile %ux%u to patched %ux%u",
-                                 kv.first.c_str(), cw, ch, pd->second.first, pd->second.second);
-                    std::visit([&](auto &enc) {
-                        enc.input_stream.width = pd->second.first;
-                        enc.input_stream.height = pd->second.second;
-                    }, kv.second.encoding);
-                }
-            }
-
-            std::visit([](auto &enc) { std::swap(enc.input_stream.width, enc.input_stream.height); },
-                       kv.second.encoding);
-        }
-
-        for (auto &res : p.application_settings.application_input_streams.resolutions)
-        {
-            auto pd = priv->encoder_patched_dims.find(res.stream_id);
-            if (pd != priv->encoder_patched_dims.end())
-            {
-                if (res.dimensions.destination_width != pd->second.first ||
-                    res.dimensions.destination_height != pd->second.second)
-                {
-                    HAL_LOG_INFO("hailo15_media: rotation: correcting app_stream '%s' from %ux%u to %ux%u",
-                                 res.stream_id.c_str(),
-                                 res.dimensions.destination_width, res.dimensions.destination_height,
-                                 pd->second.first, pd->second.second);
-                    res.dimensions.destination_width = pd->second.first;
-                    res.dimensions.destination_height = pd->second.second;
-                }
-            }
-        }
-    }
 
     p.application_settings.flip.enabled = (cfg->flip_direction != HAL_FLIP_DIRECTION_NONE);
     p.application_settings.flip.direction = static_cast<flip_direction_t>(cfg->flip_direction);

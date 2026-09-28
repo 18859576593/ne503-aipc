@@ -211,8 +211,13 @@ typedef struct {
  * Configuration passed to media init().
  *
  * Priority: config_json > config_path > platform default.
- * If image_config fields are non-zero they override corresponding values
- * parsed from the JSON / file.
+ * If image_config.rotation_angle is non-zero it is baked into the medialib
+ * profile files before the pipeline is created, so the pipeline is BUILT
+ * rotated (rotation is the only image_config field whose post-init change
+ * forces a medialib pipeline restart — the path that can wedge the DSP
+ * rotation buffers; see dynamic_change_image_config). The remaining
+ * image_config fields are captured for reference but applied via the normal
+ * dynamic_change_image_config() flow after init.
  *
  * On Hailo-15, when both @ref config_path and @ref config_json are NULL/empty, init() falls
  * back to a compiled-in default media-library config (the SDK webserver config for the Basic
@@ -232,7 +237,7 @@ typedef struct {
     const char *config_json;            /* in-memory JSON string (takes priority over config_path) */
     const char *encoder_overrides_json; /* per-stream encoder dimension overrides (JSON array) */
 
-    HalMediaImageConfig image_config;   /* image overrides applied after JSON parsing */
+    HalMediaImageConfig image_config;   /* image overrides; rotation_angle is baked into the initial build (see above) */
 
     void *priv;                         /* platform-specific extension (opaque) */
 } HalMediaConfig;

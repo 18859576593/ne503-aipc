@@ -975,6 +975,19 @@ bool CameraDaemon::set_transform_config(const aipc::camera::TransformConfig& con
         return false;
     }
 
+    // Range-validate BEFORE applying or persisting: the proto fields are
+    // uint32 and a corrupted mirror / hostile RPC could carry an out-of-range
+    // value. The HAL treats any angle as valid (an unknown enum folds to
+    // ROTATION_ANGLE_0 with rotation still enabled), so without this check a
+    // garbage value would apply "successfully", be persisted, and re-baked at
+    // every boot.
+    if (config.rotation() > HAL_ROTATION_ANGLE_270 ||
+        config.flip() > HAL_FLIP_DIRECTION_BOTH) {
+        HAL_LOG_ERROR("CameraDaemon: transform rejected: rotation=%u flip=%u out of range",
+                      config.rotation(), config.flip());
+        return false;
+    }
+
     // op_mu_ (exclusive) guards encoder/consumer state that the data path reads
     // under a shared lock (on_packet). Acquired here, then released around the
     // blocking HAL call and the post-rebuild resync/restart below to avoid
@@ -4419,6 +4432,30 @@ bool CameraDaemon::init_media() {
         mcfg.encoder_overrides_json = encoder_overrides_storage.c_str();
         HAL_LOG_INFO("CameraDaemon: Encoder overrides JSON: %s",
                      encoder_overrides_storage.c_str());
+    }
+
+    // Bake the persisted rotation into the initial pipeline build: HAL patches
+    // the rotation into the medialib profile files BEFORE initialize(), so the
+    // pipeline is created already rotated. The startup transform replay below
+    // then sees rotation unchanged → no medialib-internal pipeline restart.
+    // Without this, replaying persisted rot != 0 at every boot rides the
+    // in-place rotation path, whose internal stop→start can wedge the DSP
+    // rotation buffers (the boot-time black-screen failure mode). Rotation
+    // only: dewarp/flip/gray/dis/eis don't restart the pipeline and are safely
+    // replayed after init. Best-effort — if no mirror exists yet, first boot
+    // initializes unrotated and the replay applies the rotation through the
+    // (now full-reinit) path.
+    {
+        aipc::camera::TransformConfig persisted_transform;
+        std::string transform_mirror_lens;
+        if (load_transform_config(&persisted_transform, &transform_mirror_lens) &&
+            persisted_transform.rotation() != 0 &&
+            persisted_transform.rotation() <= HAL_ROTATION_ANGLE_270) {
+            mcfg.image_config.rotation_angle =
+                static_cast<HalRotationAngle>(persisted_transform.rotation());
+            HAL_LOG_INFO("CameraDaemon: Baking persisted rotation=%d into initial pipeline build",
+                         static_cast<int>(mcfg.image_config.rotation_angle));
+        }
     }
 
     int ret = media_ops->init(&mcfg, &media_ctx_);
