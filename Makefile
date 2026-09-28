@@ -24,8 +24,12 @@ DOCKER_PULL ?= 1
 AIPC_OS_VERSION ?= 1.12.0
 AIPC_MIN_OS_VERSION ?= $(AIPC_OS_VERSION)
 AIPC_MAX_OS_VERSION ?= $(AIPC_OS_VERSION)
-AIPC_COMPAT_LEVEL ?= 1
+# Backward-compatible single-schema default. Release callers that support a
+# migration window should set AIPC_SUPPORTED_DATA_SCHEMAS and
+# AIPC_TARGET_DATA_SCHEMA explicitly (for example "1, 2" and "2").
 AIPC_DATA_SCHEMA ?= 1
+AIPC_SUPPORTED_DATA_SCHEMAS ?= $(AIPC_DATA_SCHEMA)
+AIPC_TARGET_DATA_SCHEMA ?= $(AIPC_DATA_SCHEMA)
 AIPC_MACHINE ?= hailo15-ne503
 AIPC_PRODUCT ?= ne503
 # Factory-fitted lens baked into product.yaml at pack time: af0832 | fg2009.
@@ -243,6 +247,12 @@ docker-pack-release:
 		-e SDK_PATH="$(DOCKER_RELEASE_SDK_PATH)" \
 		-e HAILO_SDK_PATH="$(DOCKER_RELEASE_SDK_PATH)" \
 		-e BUILD_MCU_FW="$(BUILD_MCU_FW)" \
+		-e AIPC_MACHINE="$(AIPC_MACHINE)" \
+		-e AIPC_PRODUCT="$(AIPC_PRODUCT)" \
+		-e AIPC_MIN_OS_VERSION="$(AIPC_MIN_OS_VERSION)" \
+		-e AIPC_MAX_OS_VERSION="$(AIPC_MAX_OS_VERSION)" \
+		-e AIPC_SUPPORTED_DATA_SCHEMAS="$(AIPC_SUPPORTED_DATA_SCHEMAS)" \
+		-e AIPC_TARGET_DATA_SCHEMA="$(AIPC_TARGET_DATA_SCHEMA)" \
 		-e HOST_UID="$$(id -u)" \
 		-e HOST_GID="$$(id -g)" \
 		-e DOCKER_RELEASE_NODE_VERSION="$(DOCKER_RELEASE_NODE_VERSION)" \
@@ -275,7 +285,12 @@ docker-pack-release:
 			corepack enable; \
 			corepack prepare "pnpm@$$DOCKER_RELEASE_PNPM_VERSION" --activate; \
 			pnpm -v; \
-			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW" LENS_PRODUCT="$(LENS_PRODUCT)"'
+			make pack-release SDK_PATH="$$SDK_PATH" HAILO_SDK_PATH="$$HAILO_SDK_PATH" \
+				VERSION="$(VERSION)" BUILD_MCU_FW="$$BUILD_MCU_FW" LENS_PRODUCT="$(LENS_PRODUCT)" \
+				AIPC_MACHINE="$$AIPC_MACHINE" AIPC_PRODUCT="$$AIPC_PRODUCT" \
+				AIPC_MIN_OS_VERSION="$$AIPC_MIN_OS_VERSION" AIPC_MAX_OS_VERSION="$$AIPC_MAX_OS_VERSION" \
+				AIPC_SUPPORTED_DATA_SCHEMAS="$$AIPC_SUPPORTED_DATA_SCHEMAS" \
+				AIPC_TARGET_DATA_SCHEMA="$$AIPC_TARGET_DATA_SCHEMA"'
 
 ensure-mcu-toolchain:
 	@if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then \
@@ -328,6 +343,33 @@ endif
 
 _pack-stage:
 	@echo "==> Packaging release [$(VERSION), platform=$(HAL_PLATFORM)]"
+	@if [ -z "$(AIPC_MACHINE)" ] || [ -z "$(AIPC_PRODUCT)" ]; then \
+		echo "ERROR: AIPC_MACHINE and AIPC_PRODUCT must be non-empty"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_MIN_OS_VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || \
+		! printf '%s\n' "$(AIPC_MAX_OS_VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "ERROR: AIPC_MIN_OS_VERSION and AIPC_MAX_OS_VERSION must use strict x.y.z form"; \
+		exit 1; \
+	fi
+	@if [ "$$(printf '%s\n' "$(AIPC_MIN_OS_VERSION)" "$(AIPC_MAX_OS_VERSION)" | sort -V | head -1)" != "$(AIPC_MIN_OS_VERSION)" ]; then \
+		echo "ERROR: AIPC_MIN_OS_VERSION ($(AIPC_MIN_OS_VERSION)) exceeds AIPC_MAX_OS_VERSION ($(AIPC_MAX_OS_VERSION))"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_SUPPORTED_DATA_SCHEMAS)" | \
+		grep -Eq '^[[:space:]]*[1-9][0-9]*([[:space:]]*,[[:space:]]*[1-9][0-9]*)*[[:space:]]*$$'; then \
+		echo "ERROR: AIPC_SUPPORTED_DATA_SCHEMAS must be a comma-separated list of positive integers"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_TARGET_DATA_SCHEMA)" | grep -Eq '^[1-9][0-9]*$$'; then \
+		echo "ERROR: AIPC_TARGET_DATA_SCHEMA must be a positive integer"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(AIPC_SUPPORTED_DATA_SCHEMAS)" | tr ',' '\n' | tr -d '[:space:]' | \
+		grep -qx "$(AIPC_TARGET_DATA_SCHEMA)"; then \
+		echo "ERROR: target data schema $(AIPC_TARGET_DATA_SCHEMA) is not in supported set [$(AIPC_SUPPORTED_DATA_SCHEMAS)]"; \
+		exit 1; \
+	fi
 	@missing=""; \
 	for b in camera-daemon ai-runtime device-control event-bus platform-api app-manager aipc-cli device-discovery onvif-device aipc-os-updater; do \
 		[ -x "$(BUILD_DIR)/$$b" ] || missing="$$missing $$b"; \
@@ -477,9 +519,8 @@ _pack-stage:
 		'  "product": "$(AIPC_PRODUCT)",' \
 		'  "min_os_version": "$(AIPC_MIN_OS_VERSION)",' \
 		'  "max_os_version": "$(AIPC_MAX_OS_VERSION)",' \
-		'  "required_compat_level": $(AIPC_COMPAT_LEVEL),' \
-		'  "supported_data_schema": [$(AIPC_DATA_SCHEMA)],' \
-		'  "target_data_schema": $(AIPC_DATA_SCHEMA)' \
+		'  "supported_data_schema": [$(AIPC_SUPPORTED_DATA_SCHEMAS)],' \
+		'  "target_data_schema": $(AIPC_TARGET_DATA_SCHEMA)' \
 		'}' > "$(STAGE_DIR)/opt/aipc/app-manifest.json"
 	@if [ "$(SKIP_STAGE_TARBALL)" != "1" ]; then \
 		mkdir -p "$(RELEASE_DIR)"; \
