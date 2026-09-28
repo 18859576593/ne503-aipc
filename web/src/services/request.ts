@@ -74,6 +74,7 @@ const longTimeTaskMap: Record<string, number> = {
   '/api/v1/media/config/bundle': 120000, // 2 min — bundle export (~25MB)
   '/api/v1/system/clone/import': 120000, // 2 min — clone import + identity regen
   '/api/v1/system/clone/export': 120000, // 2 min — clone export
+  '/api/v1/storage/format': 300000, // 5 min — synchronous mkfs on SD/eMMC; nginx caps /api/v1/ at 300s too
 };
 
 const debouncedTimeoutError = debounce(
