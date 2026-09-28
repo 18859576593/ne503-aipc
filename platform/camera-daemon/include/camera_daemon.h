@@ -698,6 +698,22 @@ private:
     // Remains held while op_mu_ is temporarily released around blocking HAL calls.
     // This prevents two ReconfigurePipeline RPCs from entering MediaLibrary concurrently.
     std::mutex pipeline_reconfig_mu_;
+    // Serializes the full body of add_stream()/remove_stream()/
+    // reconfigure_pipeline()/reconfigure_encoder()/update_encoder_config().
+    // op_mu_ is intentionally released around blocking HAL calls in these
+    // paths, so without this guard a concurrent remove_stream +
+    // reconfigure_pipeline can interleave: reconfigure rebuilds
+    // config_.encoders from a codec list that still contains the stream being
+    // removed, resurrecting it as enabled=true right before remove finishes
+    // tearing down its HAL encoder -- every later AddStream for that stream
+    // is then rejected by the "already exists" guard until daemon restart.
+    // Held for the whole function; RAII covers every return path. Lock order:
+    // stream_op_mu_ -> pipeline_reconfig_mu_ -> op_mu_. NOT covered (known
+    // follow-ups): switch_profile() (has its own profile_switch_mu_ + throttle),
+    // set_transform_config()'s rotation_full_reinit path, and the AF worker's
+    // refresh_autofocus_video_context() (takes pipeline_reconfig_mu_ + op_mu_
+    // only, so it can still interleave with a stream add/remove HAL rebuild).
+    std::mutex stream_op_mu_;
     // Serializes the full body of switch_profile() (HAL switch + post-switch frame
     // verify + rollback). op_mu_ is intentionally released through the HAL-call and
     // verify/rollback windows, so without this guard a second concurrent profile

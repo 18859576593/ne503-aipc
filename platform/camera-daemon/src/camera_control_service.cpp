@@ -566,6 +566,10 @@ grpc::Status CameraControlServiceImpl::AddStream(
                  request->fps(), request->bitrate(), request->gop());
 
     daemon_->add_stream(*request, *response);
+    if (!response->success()) {
+        HAL_LOG_WARNING("[CameraControl] AddStream '%s' failed: %s",
+                        request->stream_id().c_str(), response->message().c_str());
+    }
     return grpc::Status::OK;
 }
 
@@ -583,6 +587,10 @@ grpc::Status CameraControlServiceImpl::RemoveStream(
     HAL_LOG_INFO("[CameraControl] RemoveStream: name=%s", request->stream_name().c_str());
 
     daemon_->remove_stream(request->stream_name(), *response);
+    if (!response->success()) {
+        HAL_LOG_WARNING("[CameraControl] RemoveStream '%s' failed: %s",
+                        request->stream_name().c_str(), response->message().c_str());
+    }
     return grpc::Status::OK;
 }
 

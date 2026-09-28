@@ -66,6 +66,15 @@ public:
 
     void add_stream(const StreamConfig& cfg, const std::string& base_dir = "/run/aipc/encoded");
     void remove_stream(const std::string& name);
+
+    // True if the stream has a live entry (socket + dispatch state). Cheap
+    // membership probe used by callers to tell a genuinely running stream
+    // from a stale enabled=true config entry left by a past race.
+    bool has_stream(const std::string& name) const;
+
+    // Snapshot of all live entry names. Returned by value so callers can
+    // iterate while mutating entries (add_stream/remove_stream).
+    std::vector<std::string> stream_names() const;
     void add_local_listener(LocalCallback cb);
     void clear_local_listeners();
     void set_keyframe_request_cb(KeyframeRequestFn fn);

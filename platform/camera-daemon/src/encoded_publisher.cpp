@@ -181,6 +181,19 @@ void EncodedPublisher::remove_stream(const std::string& name) {
     HAL_LOG_INFO("EncodedPublisher: Removed stream '%s'", name.c_str());
 }
 
+bool EncodedPublisher::has_stream(const std::string& name) const {
+    return streams_.find(name) != streams_.end();
+}
+
+std::vector<std::string> EncodedPublisher::stream_names() const {
+    std::vector<std::string> names;
+    names.reserve(streams_.size());
+    for (const auto& entry : streams_) {
+        names.push_back(entry.first);
+    }
+    return names;
+}
+
 void EncodedPublisher::add_local_listener(LocalCallback cb) {
     std::lock_guard<std::mutex> lock(listeners_mu_);
     local_listeners_.push_back(std::move(cb));

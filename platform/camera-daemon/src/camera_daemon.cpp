@@ -2174,6 +2174,11 @@ void CameraDaemon::handle_video_frame_for_routing(const std::string& dispatch_na
 }
 
 bool CameraDaemon::update_encoder_config(const std::string& stream_name, uint32_t bitrate_bps, uint32_t framerate, uint32_t gop) {
+    // Same serialization domain as add/remove/reconfigure_pipeline: an encoder
+    // param change racing a stream add/remove can interleave two MediaLibrary
+    // mutations (see stream_op_mu_ in camera_daemon.h).
+    std::lock_guard<std::mutex> stream_op_guard(stream_op_mu_);
+
     std::unique_lock<std::mutex> reconfig_lock(pipeline_reconfig_mu_, std::try_to_lock);
     if (!reconfig_lock.owns_lock()) {
         HAL_LOG_WARNING("CameraDaemon: Encoder/pipeline reconfiguration already in progress");
@@ -2270,6 +2275,11 @@ bool CameraDaemon::update_encoder_config(const std::string& stream_name, uint32_
 #ifdef HAS_GRPC
 bool CameraDaemon::reconfigure_encoder(const aipc::camera::EncoderReconfigRequest& request,
                                           aipc::camera::EncoderReconfigResponse& response) {
+    // Same serialization domain as add/remove/reconfigure_pipeline: a dimension/
+    // fps/codec reconfig does a full medialib stop+start and must not interleave
+    // with a stream add/remove HAL teardown (see stream_op_mu_ in camera_daemon.h).
+    std::lock_guard<std::mutex> stream_op_guard(stream_op_mu_);
+
     std::unique_lock<std::mutex> reconfig_lock(pipeline_reconfig_mu_, std::try_to_lock);
     if (!reconfig_lock.owns_lock()) {
         HAL_LOG_WARNING("CameraDaemon: Encoder/pipeline reconfiguration already in progress");
@@ -6262,6 +6272,14 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
         return;
     }
 
+    // Serialize stream-layout ops (add/remove/reconfigure). All three paths
+    // release op_mu_ around blocking HAL calls, so without this guard a
+    // remove_stream racing a reconfigure_pipeline resurrects the removed
+    // stream's config entry as enabled=true after its HAL encoder is already
+    // gone; every later AddStream then hits the "already exists" guard below
+    // until daemon restart.
+    std::lock_guard<std::mutex> stream_op_guard(stream_op_mu_);
+
     std::unique_lock<std::shared_mutex> lock(op_mu_);
     const std::string& stream_id = request.stream_id();
 
@@ -6275,9 +6293,32 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
     for (auto& ec : config_.encoders) {
         if (ec.stream_name == stream_id) {
             if (ec.enabled) {
-                response.set_success(false);
-                response.set_message("Stream already exists: " + stream_id);
-                return;
+                // Arbitrate on the live pipeline, not the config flag: a stale
+                // enabled=true entry (left by a past remove/reconfigure race)
+                // must not lock AddStream out forever.
+                if (!encoded_pub_) {
+                    // Publisher down (start() failed): no way to arbitrate
+                    // against the live pipeline — keep the conservative reject.
+                    HAL_LOG_WARNING(
+                        "CameraDaemon: AddStream '%s' rejected: already exists "
+                        "(encoded publisher unavailable, cannot arbitrate)",
+                        stream_id.c_str());
+                    response.set_success(false);
+                    response.set_message("Stream already exists: " + stream_id);
+                    return;
+                }
+                if (encoded_pub_->has_stream(stream_id)) {
+                    HAL_LOG_WARNING(
+                        "CameraDaemon: AddStream '%s' rejected: already exists and running",
+                        stream_id.c_str());
+                    response.set_success(false);
+                    response.set_message("Stream already exists: " + stream_id);
+                    return;
+                }
+                HAL_LOG_WARNING(
+                    "CameraDaemon: AddStream '%s': enabled in config but no live "
+                    "encoder (state drift); self-healing via re-enable",
+                    stream_id.c_str());
             }
             // Stream exists but is disabled — re-enable it
             HAL_LOG_INFO("CameraDaemon: Re-enabling disabled stream '%s'", stream_id.c_str());
@@ -6439,6 +6480,45 @@ void CameraDaemon::add_stream(const aipc::camera::AddStreamRequest& request,
                     enc_idx++;
                 }
                 i++;
+            }
+
+            // Re-register missing streams with EncodedPublisher: the rebuild
+            // above re-creates HAL encoders, but a stream torn down by a past
+            // remove (the state-drift case) has no publisher entry / UDS socket
+            // left, and without it WS streaming stays dead despite success.
+            // add_stream() on an existing name recycles its socket+clients, so
+            // only register entries the publisher is missing. Unlike
+            // reconfigure_pipeline, this path never stopped the publisher, so
+            // its accept/dispatch threads are live here: mutating streams_
+            // while they iterate it is a data race. Quiesce by stopping the
+            // publisher when (and only when) there is something to register —
+            // stop() joins the threads, add_stream defers socket creation
+            // while stopped, start() re-creates all sockets. op_mu_ is NOT
+            // held here, so the stop/join cannot take part in the
+            // op_mu_→priv->mutex cycle documented at the reconfigure site.
+            if (encoded_pub_) {
+                std::vector<const EncoderCfg*> missing;
+                for (const auto& enc : config_.encoders) {
+                    if (!enc.enabled) continue;
+                    if (encoded_pub_->has_stream(enc.stream_name)) continue;
+                    missing.push_back(&enc);
+                }
+                if (!missing.empty()) {
+                    encoded_pub_->stop();
+                    for (const auto* enc : missing) {
+                        EncodedPublisher::StreamConfig esc;
+                        esc.name   = enc->stream_name;
+                        esc.codec  = enc->codec;
+                        esc.width  = enc->width;
+                        esc.height = enc->height;
+                        encoded_pub_->add_stream(esc, config_.encoded_pub_dir);
+                        HAL_LOG_INFO("CameraDaemon: (re)registered '%s' with EncodedPublisher",
+                                     enc->stream_name.c_str());
+                    }
+                    if (!encoded_pub_->start()) {
+                        HAL_LOG_WARNING("CameraDaemon: EncodedPublisher restart after re-registration failed");
+                    }
+                }
             }
 
             // Start pipeline
@@ -6757,6 +6837,12 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         return;
     }
 
+    // Serialize against add_stream/reconfigure_pipeline (see add_stream for
+    // the race): this path erases the config entry under op_mu_, releases it,
+    // then tears down HAL — a concurrent reconfigure rebuilds
+    // config_.encoders from the not-yet-updated codec list in that window.
+    std::lock_guard<std::mutex> stream_op_guard(stream_op_mu_);
+
     std::unique_lock<std::shared_mutex> lock(op_mu_);
 
     if (stream_name == "main") {
@@ -6895,11 +6981,15 @@ void CameraDaemon::remove_stream(const std::string& stream_name,
         }
     }
 
-    // Clean up name mapping (reacquire lock briefly)
+    // Clean up name mapping (reacquire lock briefly). Erase the video-side
+    // entry too: a stale sink→display mapping would be inherited as
+    // "identity" by the next pipeline rebuild even after this sink is reused
+    // by a different stream, relabeling that stream.
     {
         std::unique_lock<std::shared_mutex> map_lock(op_mu_);
         for (auto it = encoder_name_map_.begin(); it != encoder_name_map_.end(); ++it) {
             if (it->second == stream_name) {
+                video_name_map_.erase(it->first);
                 encoder_name_map_.erase(it);
                 break;
             }
@@ -7121,8 +7211,29 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                 HAL_LOG_ERROR("CameraDaemon: failed to refresh VideoSource contexts after "
                               "profile switch");
             } else {
+                // Identity-preserving rebuild (same rule as
+                // reconfigure_pipeline): HAL video names are positional sinks
+                // with holes after a middle-stream removal, so display names
+                // are inherited from the pre-switch video_name_map_; only
+                // genuinely new sinks draw a free canonical name. Positional
+                // naming here would relabel survivors and reconfigure_pipeline
+                // would then faithfully preserve the poisoned labels.
+                const auto old_video_names = video_name_map_;
                 config_.streams.clear();
                 video_name_map_.clear();
+
+                const char* kCanonicalNames[] = {"main", "sub", "third"};
+                bool canonical_used[3] = {false, false, false};
+                std::vector<std::string> used_names;
+                for (uint32_t i = 0; i < video_count; ++i) {
+                    auto* vc = static_cast<HalVideoContext*>(vlist[i]);
+                    auto old = old_video_names.find(vc->video_name);
+                    if (old != old_video_names.end()) {
+                        for (int c = 0; c < 3; c++) {
+                            if (old->second == kCanonicalNames[c]) canonical_used[c] = true;
+                        }
+                    }
+                }
 
                 for (uint32_t i = 0; i < video_count; ++i) {
                     auto* vc = static_cast<HalVideoContext*>(vlist[i]);
@@ -7134,12 +7245,33 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
                     config_.streams.push_back(stream);
 
                     std::string display_name;
-                    switch (i) {
-                        case 0: display_name = "main"; break;
-                        case 1: display_name = "sub"; break;
-                        case 2: display_name = "third"; break;
-                        default: display_name = "stream" + std::to_string(i); break;
+                    auto old = old_video_names.find(vc->video_name);
+                    const bool inheritable =
+                        (old != old_video_names.end() &&
+                         std::find(used_names.begin(), used_names.end(), old->second) == used_names.end());
+                    if (inheritable) {
+                        display_name = old->second;
+                    } else {
+                        if (old != old_video_names.end()) {
+                            HAL_LOG_WARNING(
+                                "CameraDaemon: profile-switch video '%s': inherited name '%s' already used (duplicate legacy mapping); assigning fresh name",
+                                vc->video_name, old->second.c_str());
+                        }
+                        int c;
+                        for (c = 0; c < 3; c++) {
+                            if (!canonical_used[c]) break;
+                        }
+                        if (c < 3) {
+                            canonical_used[c] = true;
+                            display_name = kCanonicalNames[c];
+                        } else {
+                            display_name = "stream" + std::to_string(i);
+                        }
+                        HAL_LOG_INFO(
+                            "CameraDaemon: profile-switch video '%s' assigned new display name '%s'",
+                            vc->video_name, display_name.c_str());
                     }
+                    used_names.push_back(display_name);
                     video_name_map_[stream.name] = display_name;
 
                     HAL_LOG_INFO("CameraDaemon: Post-switch video '%s' ctx=%p (%ux%u@%u)",
@@ -7183,17 +7315,40 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
         ret = media_ops->get_codec_list(media_ctx_, &codec_list, &codec_count);
         if (ret >= 0 && codec_list && codec_count > 0) {
             void** clist = static_cast<void**>(codec_list);
-            for (size_t i = 0; i < codec_count && i < config_.encoders.size(); i++) {
+            // Pair codecs to config entries by pipeline identity, not list
+            // index: with a hole in the codec list the i-th codec and the
+            // i-th config entry are different streams, and positional pairing
+            // would write one stream's geometry into another's config.
+            for (uint32_t i = 0; i < codec_count; i++) {
                 auto* cc = static_cast<HalCodecContext*>(clist[i]);
-                auto& ec = config_.encoders[i];
-                ec.width = cc->config.width;
-                ec.height = cc->config.height;
-                ec.fps = cc->config.framerate;
-                ec.bitrate = cc->config.bitrate;
-                ec.gop = cc->config.intra_pic_rate;
-                ec.codec = (cc->config.packet_type == HAL_PACKET_TYPE_H265) ? "h265" : "h264";
-                HAL_LOG_INFO("CameraDaemon: Post-switch encoder (%ux%u %s %ubps)",
-                            ec.width, ec.height, ec.codec.c_str(), ec.bitrate);
+                std::string pipeline_name(cc->codec_name);
+                auto nit = encoder_name_map_.find(pipeline_name);
+                if (nit == encoder_name_map_.end()) {
+                    HAL_LOG_WARNING(
+                        "CameraDaemon: post-switch codec '%s' not in encoder_name_map_ (skipped)",
+                        pipeline_name.c_str());
+                    continue;
+                }
+                bool matched = false;
+                for (auto& ec : config_.encoders) {
+                    if (ec.stream_name != nit->second) continue;
+                    ec.width = cc->config.width;
+                    ec.height = cc->config.height;
+                    ec.fps = cc->config.framerate;
+                    ec.bitrate = cc->config.bitrate;
+                    ec.gop = cc->config.intra_pic_rate;
+                    ec.codec = (cc->config.packet_type == HAL_PACKET_TYPE_H265) ? "h265" : "h264";
+                    HAL_LOG_INFO("CameraDaemon: Post-switch encoder '%s' (%ux%u %s %ubps)",
+                                 ec.stream_name.c_str(), ec.width, ec.height,
+                                 ec.codec.c_str(), ec.bitrate);
+                    matched = true;
+                    break;
+                }
+                if (!matched) {
+                    HAL_LOG_WARNING(
+                        "CameraDaemon: post-switch codec '%s' maps to '%s' but no config entry (skipped)",
+                        pipeline_name.c_str(), nit->second.c_str());
+                }
             }
         }
     }
@@ -7390,6 +7545,15 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
         return false;
     }
 
+    // Serialize against add_stream/remove_stream (see add_stream for the
+    // race). Blocking, not try_lock: platform-api deadlines are 10s (stream
+    // add/delete), 15s (enable/disable) and 30s (pipeline reconfigure), so one
+    // queued full reinit (~5s) fits everywhere; two back-to-back queued ops
+    // can still exceed the 10s faces — callers see an error while the op
+    // completes server-side. Never nested inside op_mu_/
+    // pipeline_reconfig_mu_ — acquired first, so no lock inversion.
+    std::lock_guard<std::mutex> stream_op_guard(stream_op_mu_);
+
     std::unique_lock<std::mutex> reconfig_lock(pipeline_reconfig_mu_, std::try_to_lock);
     if (!reconfig_lock.owns_lock()) {
         HAL_LOG_WARNING("CameraDaemon: Encoder/pipeline reconfiguration already in progress");
@@ -7507,10 +7671,29 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
             // Update video_source_ contexts (old ones were freed by build_contexts)
             video_source_->init_from_context(static_cast<void**>(video_list), video_count);
 
-            // Rebuild config_.streams to match new pipeline
+            // Rebuild config_.streams to match new pipeline.
+            // HAL video names are positional sinks, and removing a middle
+            // stream leaves holes in the list ([sink0, sink2]). Naming by
+            // list index would relabel survivors (sink2 would become "sub"
+            // although it is third's source), so identity comes from the
+            // pre-rebuild video_name_map_; only genuinely new sinks draw a
+            // free canonical name.
+            const auto old_video_names = video_name_map_;
             config_.streams.clear();
             video_name_map_.clear();
             void** vlist = static_cast<void**>(video_list);
+            const char* kCanonicalNames[] = {"main", "sub", "third"};
+            bool canonical_used[3] = {false, false, false};
+            std::vector<std::string> used_names;
+            for (uint32_t i = 0; i < video_count; i++) {
+                auto* vc = static_cast<HalVideoContext*>(vlist[i]);
+                auto old = old_video_names.find(vc->video_name);
+                if (old != old_video_names.end()) {
+                    for (int c = 0; c < 3; c++) {
+                        if (old->second == kCanonicalNames[c]) canonical_used[c] = true;
+                    }
+                }
+            }
             for (uint32_t i = 0; i < video_count; i++) {
                 auto* vc = static_cast<HalVideoContext*>(vlist[i]);
                 StreamCfg sc;
@@ -7520,14 +7703,35 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
                 sc.fps = vc->config.framerate;
                 config_.streams.push_back(sc);
 
-                // Map pipeline id to config name
+                // Map pipeline id to config name (identity first)
                 std::string display_name;
-                switch (i) {
-                    case 0: display_name = "main"; break;
-                    case 1: display_name = "sub"; break;
-                    case 2: display_name = "third"; break;
-                    default: display_name = "stream" + std::to_string(i); break;
+                auto old = old_video_names.find(vc->video_name);
+                const bool inheritable =
+                    (old != old_video_names.end() &&
+                     std::find(used_names.begin(), used_names.end(), old->second) == used_names.end());
+                if (inheritable) {
+                    display_name = old->second;
+                } else {
+                    if (old != old_video_names.end()) {
+                        HAL_LOG_WARNING(
+                            "CameraDaemon: ReconfigurePipeline video '%s': inherited name '%s' already used (duplicate legacy mapping); assigning fresh name",
+                            vc->video_name, old->second.c_str());
+                    }
+                    int c;
+                    for (c = 0; c < 3; c++) {
+                        if (!canonical_used[c]) break;
+                    }
+                    if (c < 3) {
+                        canonical_used[c] = true;
+                        display_name = kCanonicalNames[c];
+                    } else {
+                        display_name = "stream" + std::to_string(i);
+                    }
+                    HAL_LOG_INFO(
+                        "CameraDaemon: ReconfigurePipeline video '%s' assigned new display name '%s'",
+                        vc->video_name, display_name.c_str());
                 }
+                used_names.push_back(display_name);
                 video_name_map_[sc.name] = display_name;
             }
 
@@ -7546,20 +7750,70 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
         uint32_t codec_count = 0;
         ret = media_ops->get_codec_list(media_ctx_, &codec_list, &codec_count);
         if (ret >= 0 && codec_list && codec_count > 0) {
+            // Same identity rule as config_.streams above: HAL codec names are
+            // positional sinks with holes after a middle-stream removal, so
+            // display names must be inherited from the pre-rebuild
+            // encoder_name_map_ instead of assigned by list index. Otherwise
+            // removing "sub" would relabel third's codec as "sub" (resurrecting
+            // the removed stream in config while third silently disappears).
+            const auto old_encoder_names = encoder_name_map_;
+            std::unordered_map<std::string, EncoderCfg> old_encoders;
+            for (const auto& e : config_.encoders) {
+                if (old_encoders.count(e.stream_name)) {
+                    HAL_LOG_WARNING(
+                        "CameraDaemon: ReconfigurePipeline: duplicate config entry '%s' (last one wins)",
+                        e.stream_name.c_str());
+                }
+                old_encoders[e.stream_name] = e;
+            }
+
             config_.encoders.clear();
             encoder_name_map_.clear();
             void** clist = static_cast<void**>(codec_list);
+            const char* kCanonicalEncNames[] = {"main", "sub", "third"};
+            bool enc_canonical_used[3] = {false, false, false};
+            std::vector<std::string> enc_used_names;
+            for (uint32_t i = 0; i < codec_count; i++) {
+                auto* cc = static_cast<HalCodecContext*>(clist[i]);
+                auto old = old_encoder_names.find(cc->codec_name);
+                if (old != old_encoder_names.end()) {
+                    for (int c = 0; c < 3; c++) {
+                        if (old->second == kCanonicalEncNames[c]) enc_canonical_used[c] = true;
+                    }
+                }
+            }
             for (uint32_t i = 0; i < codec_count; i++) {
                 auto* cc = static_cast<HalCodecContext*>(clist[i]);
                 std::string pipeline_name(cc->codec_name);
 
                 std::string display_name;
-                switch (i) {
-                    case 0: display_name = "main"; break;
-                    case 1: display_name = "sub"; break;
-                    case 2: display_name = "third"; break;
-                    default: display_name = "stream" + std::to_string(i); break;
+                auto old = old_encoder_names.find(pipeline_name);
+                const bool is_known = (old != old_encoder_names.end());
+                const bool inheritable =
+                    (is_known && std::find(enc_used_names.begin(), enc_used_names.end(), old->second) == enc_used_names.end());
+                if (inheritable) {
+                    display_name = old->second;
+                } else {
+                    if (is_known) {
+                        HAL_LOG_WARNING(
+                            "CameraDaemon: ReconfigurePipeline codec '%s': inherited name '%s' already used (duplicate legacy mapping); assigning fresh name",
+                            pipeline_name.c_str(), old->second.c_str());
+                    }
+                    int c;
+                    for (c = 0; c < 3; c++) {
+                        if (!enc_canonical_used[c]) break;
+                    }
+                    if (c < 3) {
+                        enc_canonical_used[c] = true;
+                        display_name = kCanonicalEncNames[c];
+                    } else {
+                        display_name = "stream" + std::to_string(i);
+                    }
+                    HAL_LOG_INFO(
+                        "CameraDaemon: ReconfigurePipeline codec '%s' assigned new display name '%s'",
+                        pipeline_name.c_str(), display_name.c_str());
                 }
+                enc_used_names.push_back(display_name);
 
                 EncoderCfg ec;
                 ec.stream_name = display_name;
@@ -7569,9 +7823,38 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
                 ec.bitrate = cc->config.bitrate;
                 ec.gop = cc->config.intra_pic_rate;
                 ec.codec = (cc->config.packet_type == HAL_PACKET_TYPE_H265) ? "h265" : "h264";
+                // Inherit daemon-side state the HAL codec context cannot
+                // express (enabled flag, rc mode, direct pass-through
+                // configs). Rate control params (bitrate/gop) stay from the
+                // HAL context because request overrides are applied to HAL
+                // only — config never saw them, so old-config values may be
+                // stale.
+                auto old_cfg = old_encoders.find(display_name);
+                if (old_cfg != old_encoders.end()) {
+                    ec.cbr = old_cfg->second.cbr;
+                    ec.enabled = old_cfg->second.enabled;
+                    ec.rc_mode = old_cfg->second.rc_mode;
+                    ec.config_path = old_cfg->second.config_path;
+                    ec.config_json = old_cfg->second.config_json;
+                }
                 config_.encoders.push_back(ec);
 
                 encoder_name_map_[pipeline_name] = display_name;
+            }
+
+            // Config entries whose encoder is gone from the pipeline are NOT
+            // fabricated back — log them so the drop is visible instead of a
+            // silent disappearance.
+            for (const auto& e : old_encoders) {
+                bool still_present = false;
+                for (const auto& ne : config_.encoders) {
+                    if (ne.stream_name == e.first) { still_present = true; break; }
+                }
+                if (!still_present) {
+                    HAL_LOG_WARNING(
+                        "CameraDaemon: ReconfigurePipeline: encoder '%s' absent from codec list after rebuild (dropped from config)",
+                        e.first.c_str());
+                }
             }
         }
     }
@@ -7599,6 +7882,40 @@ bool CameraDaemon::reconfigure_pipeline(const aipc::camera::ReconfigurePipelineR
         }
     }
 
+    if (encoded_pub_) {
+        // Reconcile publisher entries with the rebuilt config: entries are
+        // name-keyed and survive the pipeline rebuild, but the rebuild may
+        // have added streams (e.g. a request re-adding a just-removed one)
+        // or dropped streams. Without this, a re-added stream never gets a
+        // socket and a dropped stream keeps a zombie socket.
+        for (const auto& enc : config_.encoders) {
+            if (!enc.enabled) continue;
+            if (encoded_pub_->has_stream(enc.stream_name)) continue;
+            EncodedPublisher::StreamConfig esc;
+            esc.name = enc.stream_name;
+            esc.codec = enc.codec;
+            esc.width = enc.width;
+            esc.height = enc.height;
+            encoded_pub_->add_stream(esc, config_.encoded_pub_dir);
+            HAL_LOG_INFO("CameraDaemon: ReconfigurePipeline (re)registered '%s' with EncodedPublisher",
+                         enc.stream_name.c_str());
+        }
+        for (const auto& name : encoded_pub_->stream_names()) {
+            // audio_capture is owned by AudioService, not config_.encoders —
+            // never reconcile it here.
+            if (name == "audio_capture") continue;
+            bool in_config = false;
+            for (const auto& enc : config_.encoders) {
+                if (enc.stream_name == name) { in_config = true; break; }
+            }
+            if (!in_config) {
+                encoded_pub_->remove_stream(name);
+                HAL_LOG_WARNING(
+                    "CameraDaemon: ReconfigurePipeline removed publisher entry '%s' (stream no longer in config)",
+                    name.c_str());
+            }
+        }
+    }
     if (encoded_pub_) encoded_pub_->start();
     if (fd_pub_) fd_pub_->start();
 
