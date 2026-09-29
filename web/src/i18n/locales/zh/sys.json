@@ -383,6 +383,7 @@
       "eject_warning": "移除前请确保没有正在进行的读写操作。",
       "eject_confirm": "确定要卸载吗？",
       "formatting": "格式化中...",
+      "formatting_hint": "请勿离开此页面或刷新浏览器，格式化完成后自动解除（大容量 SD 卡可能需要几分钟）",
       "ejecting": "移除中...",
       "format_success": "格式化成功",
       "format_failed": "格式化失败",

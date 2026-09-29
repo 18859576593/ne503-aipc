@@ -383,6 +383,7 @@
       "eject_warning": "Make sure no read/write operations are in progress before ejecting.",
       "eject_confirm": "Are you sure you want to unmount?",
       "formatting": "Formatting...",
+      "formatting_hint": "Do not leave or refresh this page while formatting is in progress; it unlocks automatically when done (large SD cards may take several minutes).",
       "ejecting": "Ejecting...",
       "format_success": "Formatted successfully",
       "format_failed": "Format failed",
