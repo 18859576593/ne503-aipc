@@ -67,9 +67,12 @@ export const appsApi = {
   },
 
   // 上传 app.yaml 清单文件
-  uploadManifest: (file: File) => {
+  uploadManifest: (file: File, baseManifestPath?: string) => {
     const formData = new FormData();
     formData.append('file', file);
+    if (baseManifestPath) {
+      formData.append('base_manifest_path', baseManifestPath);
+    }
     return request.post('/api/v1/apps/upload-manifest', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
@@ -103,7 +106,11 @@ export const appsApi = {
   },
 
   // 从已上传的清单+镜像安装应用（异步，返回 task_id）
-  installPackage: (data: { manifest_path: string; image_path?: string; force?: boolean }) => request.post('/api/v1/apps/install-package', data),
+  installPackage: (data: {
+    manifest_path: string;
+    image_path?: string;
+    force?: boolean;
+  }) => request.post('/api/v1/apps/install-package', data),
 
   // 放弃尚未交给安装任务的 request-private staging
   abandonStaging: (paths: string[]) => request.post('/api/v1/apps/staging/abandon', { paths }),

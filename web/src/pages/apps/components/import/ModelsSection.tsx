@@ -14,6 +14,8 @@ import {
 } from '@/components/ui/select';
 import type { WizardConfig, WizardModelMapping } from '@/services/types';
 import { isValidModelAlias } from '@/pages/apps/lib/importFlow';
+import type { InstallIssue } from '@/pages/apps/lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 /** Select value that switches a row into custom (free-id) mode. */
 const CUSTOM_MODEL_VALUE = '__custom__';
@@ -22,6 +24,7 @@ export interface ModelsSectionProps {
   config: WizardConfig;
   onChange: (next: WizardConfig) => void;
   availableModels: Array<{ model_id: string; name?: string }>;
+  issues: InstallIssue[];
 }
 
 /**
@@ -43,6 +46,7 @@ export default function ModelsSection({
   config,
   onChange,
   availableModels,
+  issues,
 }: ModelsSectionProps) {
   const { t } = useTranslation();
   const models = config.models ?? {};
@@ -309,6 +313,7 @@ export default function ModelsSection({
             </p>
           )}
         </div>
+        <InlineValidation issues={issues} field="models" />
       </div>
 
       {/* Max QPS */}
@@ -394,6 +399,7 @@ export default function ModelsSection({
             'Allow app to discover and register models at runtime'
           )}
         </p>
+        <InlineValidation issues={issues} field="permissions.inference" />
       </div>
     </div>
   );

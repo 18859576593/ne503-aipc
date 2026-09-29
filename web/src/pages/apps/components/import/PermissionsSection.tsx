@@ -11,6 +11,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import type { WizardConfig } from '@/services/types';
+import type { InstallIssue } from '../../lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 export interface PermissionsSectionProps {
   config: WizardConfig;
@@ -22,6 +24,7 @@ export interface PermissionsSectionProps {
     fps?: number;
     status?: string;
   }>;
+  issues: InstallIssue[];
 }
 
 /**
@@ -33,6 +36,7 @@ export default function PermissionsSection({
   config,
   onChange,
   availableStreams,
+  issues,
 }: PermissionsSectionProps) {
   const { t } = useTranslation();
 
@@ -93,6 +97,7 @@ export default function PermissionsSection({
             )}
           </div>
         </ScrollArea>
+        <InlineValidation issues={issues} field="permissions.video" />
       </div>
 
       {/* Events */}
@@ -154,6 +159,7 @@ export default function PermissionsSection({
             </p>
           </div>
         </div>
+        <InlineValidation issues={issues} field="permissions.events" />
       </div>
 
       {/* Network */}
@@ -226,6 +232,7 @@ export default function PermissionsSection({
             </p>
           </div>
         )}
+        <InlineValidation issues={issues} field="permissions.network" />
       </div>
 
       {/* Device Control */}

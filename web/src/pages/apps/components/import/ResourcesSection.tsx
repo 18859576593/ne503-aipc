@@ -10,6 +10,8 @@ import {
 } from '@/components/ui/select';
 import type { WizardConfig } from '@/services/types';
 import { memoryOptionsFor } from '../../lib/formFieldOptions';
+import type { InstallIssue } from '../../lib/importFlow';
+import InlineValidation from './InlineValidation';
 
 /** backing 仍为 `N%`，输入框仅展示数字 0–100 */
 function cpuPercentToInputValue(cpu: string | undefined): string {
@@ -40,6 +42,7 @@ function inputDigitsToCpuPercent(raw: string): string {
 export interface ResourcesSectionProps {
   config: WizardConfig;
   onChange: (next: WizardConfig) => void;
+  issues: InstallIssue[];
 }
 
 /**
@@ -50,6 +53,7 @@ export interface ResourcesSectionProps {
 export default function ResourcesSection({
   config,
   onChange,
+  issues,
 }: ResourcesSectionProps) {
   const { t } = useTranslation();
 
@@ -66,6 +70,12 @@ export default function ResourcesSection({
               placeholder="50"
               className="flex-1 min-w-0"
               value={cpuPercentToInputValue(config.resources?.cpu)}
+              aria-invalid={
+                issues.some(
+                  issue => issue.field === 'resources.cpu'
+                    && issue.severity === 'error'
+                ) || undefined
+              }
               onChange={e => onChange({
                   ...config,
                   resources: {
@@ -78,6 +88,7 @@ export default function ResourcesSection({
               %
             </span>
           </div>
+          <InlineValidation issues={issues} field="resources.cpu" />
         </div>
 
         <div>
@@ -89,7 +100,15 @@ export default function ResourcesSection({
                 resources: { ...config.resources!, memory: value },
               })}
           >
-            <SelectTrigger className="mt-2">
+            <SelectTrigger
+              className="mt-2"
+              aria-invalid={
+                issues.some(
+                  issue => issue.field === 'resources.memory'
+                    && issue.severity === 'error'
+                ) || undefined
+              }
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -100,6 +119,7 @@ export default function ResourcesSection({
               ))}
             </SelectContent>
           </Select>
+          <InlineValidation issues={issues} field="resources.memory" />
         </div>
       </div>
     </div>

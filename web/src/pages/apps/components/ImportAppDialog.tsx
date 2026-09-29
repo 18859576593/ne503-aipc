@@ -51,7 +51,8 @@ import { resolveYamlViewMode, wizardConfigToYaml } from '../lib/wizardYaml';
 import {
   resolveLocalMode,
   isValidContainerImageRef,
-  collectInstallErrors,
+  collectInstallIssues,
+  type InstallIssue,
   type ImportSectionId,
 } from '../lib/importFlow';
 import BasicInfoSection from './import/BasicInfoSection';
@@ -484,7 +485,8 @@ export default function ImportAppDialog({
         yaml.attachUpload(
           new File([data.manifest_yaml ?? ''], 'app.yaml', {
             type: 'application/x-yaml',
-          })
+          }),
+          { identityBasePath: data.path }
         );
         setImageTarPath(data.image_path);
         setImageTarName(data.image || file.name);
@@ -742,19 +744,38 @@ export default function ImportAppDialog({
 
     // One-page form: run the full validation at once and jump to the
     // first offending section (the old wizard gated step by step).
-    const issues = collectInstallErrors(effectiveConfig, {
+    const issues = collectInstallIssues(effectiveConfig, {
       sourceType,
-      sourceReady: isSourceReady,
+      sourceReady:
+        sourceType === 'registry'
+          ? isValidContainerImageRef(effectiveConfig.image)
+          : !!(effectiveManifestPath || imageTarPath),
       // undefined while loading → availability check skipped (backend still
       // fast-fails); once loaded, an empty list is a real empty device.
       availableModelIds: modelsLoaded
         ? availableModels.map(m => m.model_id)
         : undefined,
+      availableStreamIds: availableStreams.map(stream => stream.stream_id),
     });
-    if (issues.length > 0) {
-      toast.error(t(`sys.apps.import.${issues[0].reason}`));
-      scrollToSection(issues[0].section);
+    const errors = issues.filter(issue => issue.severity === 'error');
+    if (errors.length > 0) {
+      toast.error(t(`sys.apps.import.${errors[0].reason}`));
+      scrollToSection(errors[0].section);
       return;
+    }
+    const warnings = issues.filter(issue => issue.severity === 'warning');
+    if (warnings.length > 0) {
+      const warningList = warnings
+        .map(issue => `• ${t(`sys.apps.import.${issue.reason}`)}`)
+        .join('\n');
+      if (
+        !window.confirm(
+          `${t('sys.apps.import.warning_confirm')}\n\n${warningList}`
+        )
+      ) {
+        scrollToSection(warnings[0].section);
+        return;
+      }
     }
 
     const duplicate = existingAppIds.has(effectiveConfig.metadata.id);
@@ -867,6 +888,15 @@ export default function ImportAppDialog({
   }, [progress?.phase]);
 
   // ---- Derived render data ----
+
+  const formIssues: InstallIssue[] = collectInstallIssues(config, {
+    sourceType,
+    sourceReady: isSourceReady,
+    availableModelIds: modelsLoaded
+      ? availableModels.map(model => model.model_id)
+      : undefined,
+    availableStreamIds: availableStreams.map(stream => stream.stream_id),
+  });
 
   const sections: { id: ImportSectionId; label: string }[] = [
     { id: 'basic_info', label: t('sys.apps.import.basic_info') },
@@ -1104,6 +1134,7 @@ export default function ImportAppDialog({
                   onChange={setConfig}
                   isIdReadOnly={isIdReadOnly}
                   existingAppIds={existingAppIds}
+                  issues={formIssues}
                 />
               </>
             )}
@@ -1111,7 +1142,11 @@ export default function ImportAppDialog({
             {activeSection === 'resources' && (
               <>
                 {sectionHeading(t('sys.apps.import.resources'))}
-                <ResourcesSection config={config} onChange={setConfig} />
+                <ResourcesSection
+                  config={config}
+                  onChange={setConfig}
+                  issues={formIssues}
+                />
               </>
             )}
 
@@ -1124,6 +1159,7 @@ export default function ImportAppDialog({
                   config={config}
                   onChange={setConfig}
                   availableModels={availableModels}
+                  issues={formIssues}
                 />
               </>
             )}
@@ -1135,6 +1171,7 @@ export default function ImportAppDialog({
                   config={config}
                   onChange={setConfig}
                   availableStreams={availableStreams}
+                  issues={formIssues}
                 />
               </>
             )}
@@ -1144,7 +1181,11 @@ export default function ImportAppDialog({
                 {sectionHeading(
                   t('sys.apps.import.advanced', 'Advanced Config')
                 )}
-                <AdvancedSection config={config} onChange={setConfig} />
+                <AdvancedSection
+                  config={config}
+                  onChange={setConfig}
+                  issues={formIssues}
+                />
               </>
             )}
           </div>
