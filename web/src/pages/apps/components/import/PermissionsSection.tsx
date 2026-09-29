@@ -235,84 +235,8 @@ export default function PermissionsSection({
         <InlineValidation issues={issues} field="permissions.network" />
       </div>
 
-      {/* Device Control */}
-      <div>
-        <Label className="text-base font-semibold mb-3 block">
-          {t('sys.apps.import.device_control')}
-        </Label>
-        <div className="space-y-2 pr-4 border rounded-lg p-3">
-          <div className="flex items-center space-x-2">
-            <Checkbox
-              checked={config.permissions?.device?.light}
-              onCheckedChange={checked => onChange({
-                  ...config,
-                  permissions: {
-                    ...config.permissions!,
-                    device: {
-                      ...config.permissions!.device!,
-                      light: !!checked,
-                    },
-                  },
-                })}
-            />
-            <Label className="font-normal">
-              {t('sys.apps.import.light_control')}
-            </Label>
-          </div>
-          <div className="flex items-center space-x-2">
-            <Checkbox
-              checked={config.permissions?.device?.ir_cut}
-              onCheckedChange={checked => onChange({
-                  ...config,
-                  permissions: {
-                    ...config.permissions!,
-                    device: {
-                      ...config.permissions!.device!,
-                      ir_cut: !!checked,
-                    },
-                  },
-                })}
-            />
-            <Label className="font-normal">{t('sys.apps.import.ir_cut')}</Label>
-          </div>
-          <div className="flex items-center space-x-2">
-            <Checkbox
-              checked={config.permissions?.device?.ptz}
-              onCheckedChange={checked => onChange({
-                  ...config,
-                  permissions: {
-                    ...config.permissions!,
-                    device: {
-                      ...config.permissions!.device!,
-                      ptz: !!checked,
-                    },
-                  },
-                })}
-            />
-            <Label className="font-normal">
-              {t('sys.apps.import.ptz_control')}
-            </Label>
-          </div>
-          <div className="flex items-center space-x-2">
-            <Checkbox
-              checked={config.permissions?.device?.lens}
-              onCheckedChange={checked => onChange({
-                  ...config,
-                  permissions: {
-                    ...config.permissions!,
-                    device: {
-                      ...config.permissions!.device!,
-                      lens: !!checked,
-                    },
-                  },
-                })}
-            />
-            <Label className="font-normal">
-              {t('sys.apps.import.lens_control', 'Lens Control')}
-            </Label>
-          </div>
-        </div>
-      </div>
+      {/* Device permissions stay in config/YAML for compatibility, but are
+       * intentionally not exposed in the v1.1.0 import form yet. */}
     </div>
   );
 }
