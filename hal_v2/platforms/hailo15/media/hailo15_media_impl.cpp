@@ -4470,6 +4470,22 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
     HAL_LOG_INFO("hailo15_media: rotation_full_reinit: angle=%d, to_portrait=%d",
                  static_cast<int>(angle), to_portrait);
 
+    /* 0. Remember the profile that was active BEFORE teardown. initialize() (step 6)
+     *    boots the fresh medialib with the config's default profile (Daylight_Basic);
+     *    without an explicit restore the pipeline keeps serving the default after a
+     *    rotation, which visibly breaks non-default modes — IR being the worst case:
+     *    color pipeline + IR-cut removed + IR illumination on -> purple image
+     *    (reproduced on 93.214, 2026-09-29). Captured here because the old media_lib
+     *    is destroyed at step 4. */
+    std::string resume_profile;
+    {
+        auto prof_exp = priv->media_lib->get_current_profile();
+        if (prof_exp.has_value())
+        {
+            resume_profile = prof_exp.value().name;
+        }
+    }
+
     /* 1. Reuse stored_config_json as-is. It is authoritative — synced to the running
      *    config at init (after encoder overrides) and after every page change
      *    (reinit_media_library_on_stream_change:5568). Do NOT re-apply encoder_overrides_json
@@ -4554,6 +4570,51 @@ static int rotation_full_reinit(void *media_ctx, HalMediaContext *hm, Hailo15Med
 
     /* 8. Update profile names list. */
     hailo15_parse_profile_names_from_config_json(patched_json, &priv->profile_names);
+
+    /* 8b. Restore the pre-rotation active profile (see step 0). Safe point: the pipeline
+     *     is NOT running yet (started at step 14) and no HAL bridges are connected
+     *     (step 15), so set_profile() here configures a fresh instance — none of the
+     *     pre-stop/disconnect dance switch_profile() needs for a RUNNING pipeline, and
+     *     no FAST_TOGGLE accumulation on a live FE stream. Restoring BEFORE
+     *     build_contexts (step 9) means the HAL contexts, the OSD refresh (step 10) and
+     *     the extras pass (step 13) all build against the restored profile — including
+     *     profile_authored_grayscale(), which must see the authored-monochrome name.
+     *     Failure (e.g. PROFILE_IS_RESTRICTED under thermal gating) degrades to the
+     *     default profile instead of failing the rotation. */
+    if (!resume_profile.empty())
+    {
+        auto cur_exp = priv->media_lib->get_current_profile();
+        const std::string cur_name = cur_exp.has_value() ? cur_exp.value().name : std::string();
+        const bool known =
+            std::find(priv->profile_names.begin(), priv->profile_names.end(), resume_profile) !=
+            priv->profile_names.end();
+        if (cur_name == resume_profile)
+        {
+            HAL_LOG_INFO("hailo15_media: rotation_full_reinit: active profile '%s' preserved",
+                         resume_profile.c_str());
+        }
+        else if (!known)
+        {
+            HAL_LOG_WARNING("hailo15_media: rotation_full_reinit: previous profile '%s' not in config "
+                            "- staying on default '%s'",
+                            resume_profile.c_str(), cur_name.c_str());
+        }
+        else
+        {
+            media_library_return r = priv->media_lib->set_profile(resume_profile);
+            if (r == MEDIA_LIBRARY_SUCCESS)
+            {
+                HAL_LOG_INFO("hailo15_media: rotation_full_reinit: restored active profile '%s' (default was '%s')",
+                             resume_profile.c_str(), cur_name.c_str());
+            }
+            else
+            {
+                HAL_LOG_WARNING("hailo15_media: rotation_full_reinit: set_profile('%s') failed (%d) "
+                                "- staying on default '%s'",
+                                resume_profile.c_str(), static_cast<int>(r), cur_name.c_str());
+            }
+        }
+    }
 
     /* 9. Rebuild HAL video/codec contexts for the new medialib. */
     destroy_contexts(priv, hm);
