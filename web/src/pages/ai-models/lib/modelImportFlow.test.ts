@@ -28,6 +28,7 @@ import {
   suggestPostprocessProfile,
   validateModelForm,
   variantFormIssue,
+  withReplacementFileFacts,
   variantOverridesProfile,
   visibleSelectOptions,
   type ModelImportFormState,
@@ -380,7 +381,11 @@ describe('buildVariantTemplate', () => {
   it('composes the keypoint pose blob exactly like the load-time composer', () => {
     const template = buildVariantTemplate({
       modelType: 'keypoint',
-      config: { threshold: 0.6, keypoint_threshold: 0.35 },
+      config: {
+        postprocess_profile: 'yolov8_pose',
+        threshold: 0.6,
+        keypoint_threshold: 0.35,
+      },
       inputWidth: 640,
       inputHeight: 640,
     });
@@ -398,7 +403,11 @@ describe('buildVariantTemplate', () => {
     // keypoint_threshold window is [0, 1]; no parsed dims → no dim keys.
     const template = buildVariantTemplate({
       modelType: 'keypoint',
-      config: { threshold: 0, keypoint_threshold: 2 },
+      config: {
+        postprocess_profile: 'yolov8_pose',
+        threshold: 0,
+        keypoint_threshold: 2,
+      },
     });
     expect(JSON.parse(template ?? '')).toEqual({
       native_yolov8_pose: true,
@@ -406,7 +415,7 @@ describe('buildVariantTemplate', () => {
     // Absent config thresholds fall back to the composer's 0.25 defaults.
     const defaults = buildVariantTemplate({
       modelType: 'keypoint',
-      config: {},
+      config: { postprocess_profile: 'yolov8_pose' },
     });
     expect(JSON.parse(defaults ?? '')).toEqual({
       native_yolov8_pose: true,
@@ -446,6 +455,20 @@ describe('buildVariantTemplate', () => {
       buildVariantTemplate({
         modelType: 'keypoint',
         config: { postprocess_profile: 'facial_landmarks', threshold: 0.5 },
+      })
+    ).toBeNull();
+  });
+
+  it('treats an absent keypoint profile as facial (legacy rows)', () => {
+    // Legacy keypoint rows predate postprocess_profile; the field filter and
+    // the loader's compatibility behavior both read "missing" as facial, so
+    // the template must not compose a pose blob for them either.
+    expect(
+      buildVariantTemplate({
+        modelType: 'keypoint',
+        config: { threshold: 0.6 },
+        inputWidth: 640,
+        inputHeight: 640,
       })
     ).toBeNull();
   });
@@ -1166,18 +1189,35 @@ describe('effectivePostprocess', () => {
     expect(out.blob).toBeNull();
   });
 
-  it('a bare name passes through as the plugin routing name', () => {
+  it('a bare detection name composes the blob the loader will submit', () => {
+    // The loader's DetectionVariantJSON replaces every non-JSON detection
+    // variant with the full composed blob (profile + stored thresholds), so
+    // the panel shows the composed payload, not verbatim routing.
+    const out = effectivePostprocess({
+      modelType: 'detection',
+      outputMode: 'platform',
+      variant: 'hailo_yolov8n',
+      config: { threshold: 0.5 },
+    });
+    expect(out.source).toBe('composed');
+    expect(out.rawVariant).toBe('hailo_yolov8n');
+    expect(out.blob).toMatchObject({ detection_threshold: 0.5 });
+  });
+
+  it('a bare non-detection name passes through as the routing name', () => {
+    // Registration passes non-detection variants through unchanged —
+    // only detection variants are rewritten by the loader.
     expect(
       effectivePostprocess({
-        modelType: 'detection',
+        modelType: 'keypoint',
         outputMode: 'platform',
-        variant: 'hailo_yolov8n',
-        config: { threshold: 0.5 },
+        variant: 'face_landmarks_custom',
+        config: {},
       })
     ).toEqual({
       source: 'passthrough-name',
       blob: null,
-      rawVariant: 'hailo_yolov8n',
+      rawVariant: 'face_landmarks_custom',
     });
   });
 
@@ -1220,6 +1260,39 @@ describe('effectivePostprocess', () => {
         config: { postprocess_profile: 'facial_landmarks' },
       })
     ).toEqual({ source: 'none', blob: null });
+  });
+});
+
+describe('withReplacementFileFacts', () => {
+  it('returns the preview untouched without a replacement file', () => {
+    const preview = buildRegisterPreview({
+      modelId: 'm1',
+      modelType: 'detection',
+      outputMode: 'platform',
+      variant: '',
+      config: {},
+    });
+    expect(withReplacementFileFacts(preview, null)).toBe(preview);
+    expect(withReplacementFileFacts(preview, undefined)).toBe(preview);
+  });
+
+  it('adds only defined file facts (diff rows vs the persisted payload)', () => {
+    const preview = { model_id: 'm1' };
+    expect(
+      withReplacementFileFacts(preview, {
+        file_hash: 'abc',
+        file_size: 1024,
+        network_name: 'yolov8n',
+        vstream_info: '{}',
+        // absent input dims must NOT surface (UpdateModel: explicit 0 = clear)
+      })
+    ).toEqual({
+      model_id: 'm1',
+      file_hash: 'abc',
+      file_size: 1024,
+      network_name: 'yolov8n',
+      vstream_info: '{}',
+    });
   });
 });
 

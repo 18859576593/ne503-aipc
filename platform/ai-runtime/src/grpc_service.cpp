@@ -680,11 +680,43 @@ bool repack_nv12_planes(uint32_t width, uint32_t height, uint32_t format,
         why = "frame format is not NV12 (repack supports NV12 only)";
         return false;
     }
+    const uint32_t w = width, h = height;
+    if (num_planes == 1) {
+        // Compact single-dmabuf NV12 (the layout bind_stream_nv12_input
+        // accepts): Y at offset 0, UV at offset w*h, both tightly packed —
+        // the same strides[0] == width contract the direct-bind path
+        // enforces for this layout. Without this arm, a declaration
+        // failure (old daemon, control-channel hiccup, quota refusal)
+        // would turn an otherwise valid stream into per-frame errors
+        // instead of the promised private-copy fallback.
+        if (fds.size() < 1) {
+            why = "NV12 frame carries no plane fds";
+            return false;
+        }
+        if (strides[0] != w) {
+            why = "single-fd NV12 repack requires a compact stride";
+            return false;
+        }
+        if (sizes[0] < (uint64_t)w * h * 3 / 2) {
+            why = "single-fd NV12 buffer smaller than width*height*3/2";
+            return false;
+        }
+        out.assign((size_t)w * h * 3 / 2, '\0');
+        void* map = mmap(nullptr, sizes[0], PROT_READ, MAP_SHARED, fds[0], 0);
+        if (map == MAP_FAILED) {
+            why = "mmap of NV12 buffer failed";
+            return false;
+        }
+        memcpy(out.data(), static_cast<const char*>(map),
+               (size_t)w * h * 3 / 2);
+        munmap(map, sizes[0]);
+        return true;
+    }
     if (num_planes != 2) {
-        why = "NV12 frame must have 2 planes, got " + std::to_string(num_planes);
+        why = "NV12 frame must have 1 or 2 planes, got "
+              + std::to_string(num_planes);
         return false;
     }
-    const uint32_t w = width, h = height;
     if (w == 0 || h == 0 || (h & 1) != 0) {
         why = "invalid NV12 geometry";
         return false;
@@ -2848,6 +2880,11 @@ grpc::Status AIRuntimeServiceImpl::StreamInfer(
                             inputs[0].shape[1] =
                                 static_cast<int32_t>(frame.width);
                             input_owner = nv12;
+                            // build_nv12_tensors filled inputs[1] with the
+                            // second source plane; the packed buffer
+                            // replaces BOTH planes — submit one input and
+                            // drop the stale DMA reference.
+                            num_inputs = 1;
                             repack_us += now_us() - t0;
                         } else {
                             frame.delivery.acknowledge();

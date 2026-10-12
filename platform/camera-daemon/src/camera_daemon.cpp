@@ -773,34 +773,57 @@ void CameraDaemon::run() {
                  persisted_profile != current);
             if (will_replay_switch &&
                 !verify_primary_stream_frames(10000)) {
-                HAL_LOG_WARNING("CameraDaemon: initial pipeline not delivering frames "
-                                "before profile replay; attempting switch anyway");
-            }
-            if (force_day_on_boot && persisted_infrared_profile) {
-                // Infrared is an operating mode, not a boot profile. Do not
-                // restore a stale night profile when product policy is Day.
-                HAL_LOG_INFO("CameraDaemon: ignoring persisted infrared profile '%s'; default_mode=day",
-                             persisted_profile.c_str());
-                if (current == config_.infrared.infrared_profile) {
-                    std::string msg;
-                    if (!switch_profile("Daylight_Basic", &msg, kBootReplayVerifyBudgetMs)) {
-                        HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
-                                      msg.c_str());
-                    }
-                    current = get_current_profile();
-                }
-                persist_profile_config(current);
-            } else if (!persisted_profile.empty() && persisted_profile != current) {
-                HAL_LOG_INFO("CameraDaemon: applying persisted profile '%s' (current '%s')",
-                             persisted_profile.c_str(), current.c_str());
-                std::string msg;
-                if (!switch_profile(persisted_profile, &msg, kBootReplayVerifyBudgetMs)) {
-                    HAL_LOG_WARNING("CameraDaemon: replay profile switch to '%s' failed: %s; continuing with '%s'",
-                                    persisted_profile.c_str(), msg.c_str(), current.c_str());
-                }
+                // Skip the replay; do not push through. A switch before the
+                // pipeline's first coded frame recreates the -2815
+                // black-pipeline failure described above (and the leaked bus
+                // watch kills the rollback switch too). Staying on the
+                // running default profile is recoverable; the wedge is not.
+                HAL_LOG_ERROR("CameraDaemon: initial pipeline not delivering frames; "
+                              "skipping boot profile replay");
             } else {
-                HAL_LOG_INFO("CameraDaemon: persisted profile '%s' already active; no replay switch",
-                             persisted_profile.c_str());
+                // The verify wait is unlocked and can last up to 10s, and
+                // gRPC has been serving since init(): a live SwitchProfile
+                // may have switched AND persisted a newer profile inside
+                // that window. Replaying the pre-wait snapshot would
+                // silently reverse that successful request (and re-persist
+                // the stale name), so stand down if the persisted profile
+                // moved during the gate.
+                std::string persisted_now;
+                if (load_profile_config(&persisted_now) &&
+                    persisted_now != persisted_profile) {
+                    HAL_LOG_INFO("CameraDaemon: persisted profile changed during the boot "
+                                 "replay gate ('%s' -> '%s'); leaving it in place",
+                                 persisted_profile.c_str(),
+                                 persisted_now.c_str());
+                } else {
+                    current = get_current_profile();
+                    if (force_day_on_boot && persisted_infrared_profile) {
+                        // Infrared is an operating mode, not a boot profile. Do not
+                        // restore a stale night profile when product policy is Day.
+                        HAL_LOG_INFO("CameraDaemon: ignoring persisted infrared profile '%s'; default_mode=day",
+                                     persisted_profile.c_str());
+                        if (current == config_.infrared.infrared_profile) {
+                            std::string msg;
+                            if (!switch_profile("Daylight_Basic", &msg, kBootReplayVerifyBudgetMs)) {
+                                HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
+                                              msg.c_str());
+                            }
+                            current = get_current_profile();
+                        }
+                        persist_profile_config(current);
+                    } else if (!persisted_profile.empty() && persisted_profile != current) {
+                        HAL_LOG_INFO("CameraDaemon: applying persisted profile '%s' (current '%s')",
+                                     persisted_profile.c_str(), current.c_str());
+                        std::string msg;
+                        if (!switch_profile(persisted_profile, &msg, kBootReplayVerifyBudgetMs)) {
+                            HAL_LOG_WARNING("CameraDaemon: replay profile switch to '%s' failed: %s; continuing with '%s'",
+                                            persisted_profile.c_str(), msg.c_str(), current.c_str());
+                        }
+                    } else {
+                        HAL_LOG_INFO("CameraDaemon: persisted profile '%s' already active; no replay switch",
+                                     persisted_profile.c_str());
+                    }
+                }
             }
         }
     }
@@ -6235,7 +6258,9 @@ bool CameraDaemon::get_device_hardware_status(aipc::camera::DeviceHardwareStatus
         auto* led_ops = hal_loader_->led();
         uint8_t duty = 0;
         if (led_ops->led_get_duty) {
-            if (led_ops->led_get_duty(ctx, 0, &duty) == HAL_OK) {
+            // white2 (dedicated white channel) — the same MCU LED the
+            // SetWhiteLight write path drives; 0 is the near-IR fill light.
+            if (led_ops->led_get_duty(ctx, 2, &duty) == HAL_OK) {
                 status.set_white_light_duty(duty);
             }
             if (led_ops->led_get_duty(ctx, 1, &duty) == HAL_OK) {

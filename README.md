@@ -10,7 +10,7 @@ Open-source edge AI runtime for smart cameras and edge devices.
 [Quick start](#quick-start) ·
 [Architecture](#architecture) ·
 [Documentation](docs/README.md) ·
-[Download](https://github.com/camthink-ai/neoruntime/releases/latest) ·
+[Download](https://github.com/camthink-ai/neoruntime/releases) ·
 [SDKs](https://github.com/camthink-ai/neoruntime-sdks) ·
 [Sample apps](https://github.com/camthink-ai/neoruntime-apps)
 
@@ -44,7 +44,7 @@ by implementing the HAL v2 interfaces.
 | ------------ | ---------- |
 | Validate or develop NeoRuntime on a host | [Host build](#host-build) |
 | Build a Hailo-15 device release | [Docker release build](#hailo-15-release-build) |
-| Download a packaged release | [Latest GitHub release](https://github.com/camthink-ai/neoruntime/releases/latest) |
+| Download a packaged release | [Releases](https://github.com/camthink-ai/neoruntime/releases) — newest `v*` tag (`ct-disc-v*` releases carry host tools only, no device package) |
 | Deploy or upgrade a device | [Deployment guide](docs/deployment/DEPLOYMENT.md) |
 | Build an application | [NeoRuntime Apps](https://github.com/camthink-ai/neoruntime-apps) |
 | Integrate through Python or C++ | [NeoRuntime SDKs](https://github.com/camthink-ai/neoruntime-sdks) |
@@ -63,7 +63,7 @@ cd neoruntime
 
 ./scripts/setup_env.sh layer1
 make build-ci
-make test
+make test  # needs gcc: -race uses cgo; layer2 installs a toolchain
 ```
 
 Build the native services and stub HAL as well:
@@ -92,6 +92,23 @@ make docker-pack-release VERSION=1.0.0
 The package is written to
 `build/release/neoruntime-hailo15-1.0.0.tar.gz`. MCU OTA firmware is rebuilt by
 default; pass `BUILD_MCU_FW=0` only when packaging existing MCU artifacts.
+
+To use the same container as an interactive build environment — shell
+access to the Hailo/Poky SDK for running individual make targets:
+
+```bash
+docker pull camthink/ne503-dev:v1.0
+docker run --rm -it --entrypoint /bin/bash --user root \
+  -v "$PWD:/ne503" -w /ne503 -e SDK_PATH=/opt/hailo-sdk \
+  camthink/ne503-dev:v1.0
+```
+
+Inside the container:
+
+```bash
+git config --global --add safe.directory /ne503
+make pack-release VERSION=0.1.0
+```
 
 For local cross-compilation with a vendor SDK, see the
 [build guide](docs/getting-started/BUILD.md).
@@ -156,7 +173,7 @@ diagrams.
 
 | Workflow | Requirements |
 | -------- | ------------ |
-| Go services and web console | Go 1.25+, protobuf tools, Node.js 24, pnpm 10 |
+| Go services and web console | Go 1.25+, protobuf tools, Node.js 24, pnpm 10, C compiler (`make test` runs `go test -race`, which needs cgo) |
 | Native host build | Above, plus CMake 3.16+, GCC/G++ 10+, and gRPC C++ tools |
 | Hailo-15 build in Docker | Git and Docker |
 | Local Hailo-15 cross-build | Native toolchain plus the Hailo/Poky SDK |

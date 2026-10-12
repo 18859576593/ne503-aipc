@@ -733,6 +733,9 @@ export default function ImportModelDialog({
             // Update mode: snapshot of the loaded row — drives the editor's
             // changed-keys diff view and reload banner.
             initialForm={initialFormRef.current}
+            // Replacement-HEF facts feed the edit diff (added rows against
+            // the persisted payload — a file swap reloads the model).
+            replacementFile={parseResult}
             existingModelIds={modelsReady ? existingModelIdSet : null}
             disabled={isLoading}
             navHeader={navHeader}

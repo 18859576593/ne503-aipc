@@ -692,6 +692,15 @@ void FdPublisher::handle_frame_in_use(ClientState* client, const void* msg_data)
         std::lock_guard<std::mutex> clock(clients_mu_);
         for (auto& [fd, cs] : clients_) {
             if (cs == client) continue;
+            // Cross-CONNECTION, not cross-PROCESS: frame_id is global and
+            // every subscriber holds the same id, so an unrestricted scan
+            // could resolve (and later flag) ANOTHER process's entry whose
+            // normal RELEASE would drop this declarer's exemption
+            // mid-read. Resolve only against connections of the declaring
+            // peer (SO_PEERCRED identity); an unreadable identity fails
+            // closed — the caller falls back to a private copy.
+            if (client->identity.empty() || cs->identity != client->identity)
+                continue;
             std::lock_guard<std::mutex> olock(cs->outstanding_mu);
             auto it = cs->outstanding.find(frame_id);
             if (it != cs->outstanding.end() && it->second.mf &&
@@ -714,40 +723,41 @@ void FdPublisher::handle_frame_in_use(ClientState* client, const void* msg_data)
         if (!router_ || !router_->mark_frame_in_use(frame_id)) {
             code = -1;
         } else {
+            // Flag and charge the OWNING entry — a connection of the
+            // DECLARING process. The declaring control connection never
+            // holds frames, so charging it would strand the quota: its
+            // RELEASE hits "unknown frame_id" and only a disconnect would
+            // ever zero the counter (three grants would cap the declarer
+            // for the process lifetime). Charging the flagged owner makes
+            // its RELEASE — or its connection teardown — converge BOTH
+            // the watchdog reference and the cap counter. If no entry
+            // survives the re-scan the frame was released concurrently
+            // and untrack already dropped our reference: report failure,
+            // never success.
+            bool flagged = false;
             bool capped = false;
-            {
-                std::lock_guard<std::mutex> dlock(client->outstanding_mu);
-                if (client->in_use_count >= config_.max_outstanding_per_client) {
+            for (auto& [fd2, cs2] : clients_) {
+                if (cs2->identity != client->identity) continue;
+                std::lock_guard<std::mutex> olock(cs2->outstanding_mu);
+                auto it = cs2->outstanding.find(frame_id);
+                if (it == cs2->outstanding.end()) continue;
+                if (cs2->in_use_count >= config_.max_outstanding_per_client) {
                     capped = true;
-                } else {
-                    client->in_use_count++;
+                    break;
                 }
+                it->second.hw_in_use = true;
+                cs2->in_use_count++;
+                flagged = true;
+                break;
             }
             if (capped) {
                 router_->clear_frame_in_use(frame_id);  // undo the grant
                 code = -2;
+            } else if (!flagged) {
+                router_->clear_frame_in_use(frame_id);
+                code = -1;
             } else {
-                // Flag the OWNING entry (any connection, sender included)
-                // so its RELEASE — or its connection teardown — drops the
-                // watchdog reference. If no entry survives the re-scan the
-                // frame was released concurrently and untrack already
-                // dropped our reference: report failure, never success.
-                bool flagged = false;
-                for (auto& [fd2, cs2] : clients_) {
-                    std::lock_guard<std::mutex> olock(cs2->outstanding_mu);
-                    auto it = cs2->outstanding.find(frame_id);
-                    if (it != cs2->outstanding.end()) {
-                        it->second.hw_in_use = true;
-                        flagged = true;
-                        break;
-                    }
-                }
-                if (!flagged) {
-                    router_->clear_frame_in_use(frame_id);
-                    code = -1;
-                } else {
-                    code = 0;
-                }
+                code = 0;
             }
         }
     }

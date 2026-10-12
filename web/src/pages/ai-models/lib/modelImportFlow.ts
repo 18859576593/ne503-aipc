@@ -354,9 +354,14 @@ export function buildVariantTemplate(
     // there is nothing to compose — the decoder reads no configuration, and
     // inserting a pose blob here would silently WIN over the profile at
     // load time (escape-hatch precedence) and switch decoders outright.
+    // An absent profile means facial: legacy keypoint rows predate the
+    // profile key, and filterFieldsByProfile plus the loader's compatibility
+    // behavior both read "missing" as facial_landmarks — composing a pose
+    // blob for them would silently switch decoders on rows that never
+    // opted in.
     const profile =      typeof input.config.postprocess_profile === 'string'
         ? input.config.postprocess_profile
-        : 'yolov8_pose';
+        : 'facial_landmarks';
     if (profile === 'facial_landmarks') {
       return null;
     }
@@ -622,7 +627,7 @@ export interface EffectivePostprocess {
   source:
     | 'custom-blob' // '{'-variant wins verbatim over the composed config
     | 'composed' // synthesized from config + profile at load time
-    | 'passthrough-name' // bare plugin routing name
+    | 'passthrough-name' // bare plugin routing name (non-detection types)
     | 'none-raw' // raw delivery: no postprocess payload at all
     | 'none'; // no variant surface for this type/profile
   /** Parsed blob for 'custom-blob'/'composed'; null otherwise (and for a
@@ -659,9 +664,16 @@ export function effectivePostprocess(input: {
     }
     return { source: 'custom-blob', blob: null, rawVariant: variant };
   }
-  if (variant !== '') {
+  if (variant !== '' && input.modelType !== 'detection') {
+    // Non-detection bare names reach the runtime verbatim — the loader's
+    // registration path passes non-detection variants through unchanged.
     return { source: 'passthrough-name', blob: null, rawVariant: variant };
   }
+  // A bare DETECTION name is not a passthrough either: the loader's
+  // DetectionVariantJSON replaces every non-JSON detection variant with the
+  // full blob composed from the selected profile and stored thresholds (and
+  // the runtime expands a directly supplied bare name the same way), so the
+  // panel shows what will actually run instead of claiming verbatim routing.
   const template = buildVariantTemplate({
     modelType: input.modelType,
     config: input.config,
@@ -669,11 +681,14 @@ export function effectivePostprocess(input: {
     inputHeight: input.inputHeight,
   });
   if (template === null) {
-    return { source: 'none', blob: null };
+    return variant !== ''
+      ? { source: 'passthrough-name', blob: null, rawVariant: variant }
+      : { source: 'none', blob: null };
   }
   return {
     source: 'composed',
     blob: JSON.parse(template) as Record<string, unknown>,
+    ...(variant !== '' ? { rawVariant: variant } : {}),
   };
 }
 
@@ -848,6 +863,44 @@ export function buildRegisterPreview(
     config: { ...form.config },
     model_variant: form.variant.trim(),
   };
+}
+
+/** File-identity facts a replacement HEF adds to an update request — the
+ *  same fields the import dialog threads from its parse result into
+ *  UpdateModel. A replacement reloads the model even when every form field
+ *  is unchanged, so the edit diff must surface them; the persisted payload
+ *  carries none of these keys, so they render as added rows. */
+export type ReplacementFileFacts = {
+  file_hash?: string;
+  file_size?: number;
+  network_name?: string;
+  vstream_info?: string;
+  input_width?: number;
+  input_height?: number;
+};
+
+/** Fold the replacement file's identity facts into a register preview.
+ *  Only keys with a defined value are added (an unknown dimension must not
+ *  appear as a change — UpdateModel treats an explicit 0 as "clear"). */
+export function withReplacementFileFacts(
+  preview: Record<string, unknown>,
+  facts: ReplacementFileFacts | null | undefined
+): Record<string, unknown> {
+  if (!facts) return preview;
+  const merged: Record<string, unknown> = { ...preview };
+  const keys: (keyof ReplacementFileFacts)[] = [
+    'file_hash',
+    'file_size',
+    'network_name',
+    'vstream_info',
+    'input_width',
+    'input_height',
+  ];
+  for (const key of keys) {
+    const value = facts[key];
+    if (value !== undefined && value !== null) merged[key] = value;
+  }
+  return merged;
 }
 
 /** Full form validation, shared by the inline (onBlur, per-field) display

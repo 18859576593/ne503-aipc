@@ -21,8 +21,10 @@ import {
   validateModelForm,
   variantFormIssue,
   variantOverridesProfile,
+  withReplacementFileFacts,
   type ModelImportFormState,
   type ModelImportSectionId as SectionId,
+  type ReplacementFileFacts,
 } from '../../lib/modelImportFlow';
 import BasicInfoSection from './BasicInfoSection';
 import OutputSection from './OutputSection';
@@ -91,6 +93,12 @@ export interface ModelConfigEditorProps {
   /** Parsed HEF's network dimensions — the keypoint variant template
    * records them (create-time keys); undefined in detail edit mode. */
   inputDims?: { width?: number; height?: number };
+  /** Update mode with a replacement HEF selected: its file-identity facts
+   * (hash/size/network/vstream/dims) are folded into the edit diff — the
+   * replacement reloads the model even when every form field is unchanged,
+   * and the persisted payload carries none of these keys. Null when no
+   * new file was uploaded (metadata-only update). */
+  replacementFile?: ReplacementFileFacts | null;
   /** Normalized ids of registered models; null = list not loaded yet. */
   existingModelIds?: Set<string> | null;
   disabled?: boolean;
@@ -123,6 +131,7 @@ const ModelConfigEditor = forwardRef<
       vstreamInfo,
       suggestedType,
       inputDims,
+      replacementFile = null,
       existingModelIds = null,
       disabled = false,
       navHeader,
@@ -380,7 +389,7 @@ const ModelConfigEditor = forwardRef<
               isUpdate && initialForm ? (
                 <EditDiffPane
                   before={buildRegisterPreview(initialForm)}
-                  after={preview}
+                  after={withReplacementFileFacts(preview, replacementFile)}
                 />
               ) : (
                 <JsonPreviewPane preview={preview} />

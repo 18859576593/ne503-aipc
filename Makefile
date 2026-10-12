@@ -19,6 +19,26 @@ SDK_PATH ?= $(or $(HAILO_SDK_PATH),/opt/hailo-sdk)
 DOCKER_RELEASE_IMAGE ?= camthink/ne503-dev:v1.0
 DOCKER_RELEASE_WORKDIR ?= /ne503
 DOCKER_RELEASE_SDK_PATH ?= /opt/hailo-sdk
+# Optional external SDK for docker-pack-release: host directory of an
+# extracted Poky SDK, mounted over the image's baked-in SDK. The poky
+# installer bakes its install-time absolute path into every toolchain
+# binary (PT_INTERP/RPATH) and into environment-setup-*; when that prefix
+# differs from the in-container mount point we bind the same directory at
+# both paths so the loader resolves either one. Uses --mount (not -v):
+# a missing host path is a hard error instead of a silently created empty
+# directory shadowing the baked-in SDK.
+DOCKER_RELEASE_SDK_HOST_DIR ?=
+ifeq ($(strip $(DOCKER_RELEASE_SDK_HOST_DIR)),)
+DOCKER_RELEASE_SDK_MOUNT :=
+else
+DOCKER_RELEASE_SDK_PREFIX := $(shell sed -n 's/^export OECORE_NATIVE_SYSROOT="\([^"]*\)\/sysroots\/x86_64-pokysdk-linux"/\1/p' $(DOCKER_RELEASE_SDK_HOST_DIR)/environment-setup-*-poky-linux 2>/dev/null)
+DOCKER_RELEASE_SDK_MOUNT := --mount type=bind,source=$(DOCKER_RELEASE_SDK_HOST_DIR),target=$(DOCKER_RELEASE_SDK_PATH),readonly
+ifneq ($(strip $(DOCKER_RELEASE_SDK_PREFIX)),)
+ifneq ($(DOCKER_RELEASE_SDK_PREFIX),$(DOCKER_RELEASE_SDK_PATH))
+DOCKER_RELEASE_SDK_MOUNT += --mount type=bind,source=$(DOCKER_RELEASE_SDK_HOST_DIR),target=$(DOCKER_RELEASE_SDK_PREFIX),readonly
+endif
+endif
+endif
 DOCKER_RELEASE_NODE_VERSION ?= 24.18.0
 DOCKER_RELEASE_PNPM_VERSION ?= 10.34.5
 DOCKER_PULL ?= 1
@@ -239,11 +259,17 @@ tools:
 docker-pack-release:
 	@echo "==> Building Hailo-15 release package in Docker"
 	@echo "    image: $(DOCKER_RELEASE_IMAGE)"
+	@if [ -n "$(strip $(DOCKER_RELEASE_SDK_HOST_DIR))" ] && [ ! -d "$(DOCKER_RELEASE_SDK_HOST_DIR)" ]; then \
+		echo "ERROR: DOCKER_RELEASE_SDK_HOST_DIR $(DOCKER_RELEASE_SDK_HOST_DIR) does not exist on this machine."; \
+		echo "       The poky SDK must be extracted on this runner first; refusing to build with the image's baked-in SDK shadowed by an empty bind."; \
+		exit 1; \
+	fi
 	@if [ "$(DOCKER_PULL)" = "1" ]; then docker pull "$(DOCKER_RELEASE_IMAGE)"; fi
 	docker run --rm -t \
 		--entrypoint /bin/bash \
 		--user root \
 		-v "$(CURDIR):$(DOCKER_RELEASE_WORKDIR)" \
+		$(DOCKER_RELEASE_SDK_MOUNT) \
 		-w "$(DOCKER_RELEASE_WORKDIR)" \
 		-e SDK_PATH="$(DOCKER_RELEASE_SDK_PATH)" \
 		-e HAILO_SDK_PATH="$(DOCKER_RELEASE_SDK_PATH)" \

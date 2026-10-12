@@ -681,6 +681,35 @@ static const DirectCtrlCid k_direct_cproc_cids[] = {
     {v4l2::Video0Ctrl::CONTRAST, 0x00983207u},
 };
 static const uint32_t k_cproc_enable_cid = 0x00983200u;
+static std::optional<uint32_t> v4l2_find_ctrl_id_by_name(int fd, const char *ctrl_name);
+
+/**
+ * Resolve the cproc-enable CID by control NAME, not by number: the numeric ID
+ * differs between kernel BSPs (meta-hailo-os registers the family at
+ * V4L2_CID_USER_BASE + 0x2900, the deployed NE503 kernel at +0x3200), and a
+ * direct S_CTRL to an unregistered ID returns EINVAL. A hard-coded number
+ * would make apply_manual() fail wholesale on the other BSP before ever
+ * writing brightness/contrast/saturation. Falls back to the deployed-kernel
+ * ID when the query walk fails (older kernels, permission quirks). Cached:
+ * one walk per process.
+ */
+static uint32_t cproc_enable_cid()
+{
+    static const uint32_t cid = [] {
+        const int fd = open("/dev/video0", O_RDWR | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            const auto found = v4l2_find_ctrl_id_by_name(fd, "isp_cproc_enable");
+            close(fd);
+            if (found.has_value())
+            {
+                return *found;
+            }
+        }
+        return k_cproc_enable_cid;
+    }();
+    return cid;
+}
 
 static bool direct_cproc_s_ctrl(v4l2::Video0Ctrl ctrl, int32_t value)
 {
@@ -708,7 +737,8 @@ static bool direct_cproc_s_ctrl(v4l2::Video0Ctrl ctrl, int32_t value)
 
 /**
  * Open the cproc gate (isp_cproc_enable). Not in the medialib manager map, so this
- * is a direct S_CTRL with the kernel CID. Returns false when the write is rejected —
+ * is a direct S_CTRL with the name-resolved CID (BSP-dependent number; see
+ * cproc_enable_cid). Returns false when the write is rejected —
  * callers treat it as fatal for the manual apply (a closed gate means the picture
  * silently ignores every B/C/S value).
  */
@@ -721,7 +751,7 @@ static bool direct_cproc_enable(int32_t value)
     }
     struct v4l2_control v4l2_ctrl;
     memset(&v4l2_ctrl, 0, sizeof(v4l2_ctrl));
-    v4l2_ctrl.id = k_cproc_enable_cid;
+    v4l2_ctrl.id = cproc_enable_cid();
     v4l2_ctrl.value = value;
     const bool ok = (ioctl(fd, VIDIOC_S_CTRL, &v4l2_ctrl) == 0);
     close(fd);
