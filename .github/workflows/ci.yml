@@ -1,10 +1,14 @@
 name: CI
 
 on:
+  # Doc-only edits skip the whole matrix. docs/** is deliberately NOT
+  # ignored: docs/api/swagger.yaml is guarded by the swagger-sync job.
   pull_request:
     branches: [main, develop, 'release/**']
+    paths-ignore: ['**.md', 'LICENSE']
   push:
     branches: [main, develop, 'release/**']
+    paths-ignore: ['**.md', 'LICENSE']
 
 concurrency:
   group: ci-${{ github.ref }}
