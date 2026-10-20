@@ -736,7 +736,15 @@ void CameraDaemon::run() {
         // with that budget rolls back to the default profile on every boot.
         constexpr uint64_t kBootReplayVerifyBudgetMs = 15000;
         std::string persisted_profile;
-        if (load_profile_config(&persisted_profile)) {
+        const bool have_persisted_profile = load_profile_config(&persisted_profile);
+        // Fresh unit, nothing persisted yet: the compiled-in default day
+        // profile is the standing intent — record it so the per-lens day
+        // mapping below can still resolve the lens variant on first boot.
+        if (!have_persisted_profile) {
+            persisted_profile = "Daylight_Basic";
+        }
+        if (have_persisted_profile ||
+            config_.media_daylight_profile != "Daylight_Basic") {
             // Pre-per-lens images persisted the shared IR entry name. Map it
             // to this lens's effective entry so the guard and the replay use
             // the same name the daemon would switch to (and so the guard
@@ -748,6 +756,17 @@ void CameraDaemon::run() {
                              persisted_profile.c_str(),
                              config_.infrared.infrared_profile.c_str());
                 persisted_profile = config_.infrared.infrared_profile;
+            }
+            // Same mapping for the day profile: a pre-per-lens image (or the
+            // synthesized first-boot default above) carries the generic
+            // Daylight_Basic; map it to this lens's entry so the guard and
+            // the replay switch use the name the daemon would switch to.
+            if (persisted_profile == "Daylight_Basic" &&
+                config_.media_daylight_profile != "Daylight_Basic") {
+                HAL_LOG_INFO("CameraDaemon: mapping persisted day profile '%s' -> '%s' (per-lens)",
+                             persisted_profile.c_str(),
+                             config_.media_daylight_profile.c_str());
+                persisted_profile = config_.media_daylight_profile;
             }
             std::string current = get_current_profile();
             const bool force_day_on_boot = config_.infrared.enabled &&
@@ -804,9 +823,9 @@ void CameraDaemon::run() {
                                      persisted_profile.c_str());
                         if (current == config_.infrared.infrared_profile) {
                             std::string msg;
-                            if (!switch_profile("Daylight_Basic", &msg, kBootReplayVerifyBudgetMs)) {
-                                HAL_LOG_ERROR("CameraDaemon: failed to restore Daylight_Basic from infrared profile: %s",
-                                              msg.c_str());
+                            if (!switch_profile(config_.media_daylight_profile, &msg, kBootReplayVerifyBudgetMs)) {
+                                HAL_LOG_ERROR("CameraDaemon: failed to restore day profile '%s' from infrared profile: %s",
+                                              config_.media_daylight_profile.c_str(), msg.c_str());
                             }
                             current = get_current_profile();
                         }
@@ -5805,7 +5824,7 @@ bool CameraDaemon::set_imaging_mode(ImagingMode mode, std::string* message) {
         const std::string day_profile =
             day_profile_before_infrared_.empty() ||
                     day_profile_before_infrared_ == config_.infrared.infrared_profile
-                ? "Daylight_Basic"
+                ? config_.media_daylight_profile
                 : day_profile_before_infrared_;
         if (ok) ok = switch_profile_internal(day_profile, false, &error);
         if (ok) ok = wait_stable();
