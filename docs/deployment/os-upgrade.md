@@ -125,7 +125,7 @@ semantically (`1.9.0 < 1.10.0`). Checks, in order:
 
 Legacy images with no `/etc/aipc-os-release` at all allow the install with a
 warning. Packaging defaults `min_os_version = max_os_version = <current OS
-version>` (`AIPC_OS_VERSION ?= 1.13.0` in the Makefile), which is equivalent
+version>` (`AIPC_OS_VERSION ?= 1.12.0` in the Makefile), which is equivalent
 to an exact match; widen the range explicitly when a package is known to span
 OS versions.
 
