@@ -47,7 +47,7 @@
       "strength": [
         35,
         40,
-        55,
+        40,
         60,
         80,
         100,
@@ -1260,7 +1260,7 @@
       "disable": false,
       "enable": true,
       "flat_strength": [
-        0,
+        2,
         1,
         0,
         0,
@@ -1270,7 +1270,7 @@
         0
       ],
       "flat_thr": [
-        0,
+        3,
         1,
         0,
         0,
@@ -1301,7 +1301,7 @@
         0
       ],
       "high_strength": [
-        35,
+        45,
         45,
         45,
         40,
@@ -1311,7 +1311,7 @@
         95
       ],
       "low_strength": [
-        50,
+        25,
         30,
         30,
         35,
@@ -2800,7 +2800,7 @@
         0
       ],
       "ee_y_down_gain": [
-        6500,
+        4000,
         5000,
         5000,
         5000,
@@ -2810,7 +2810,7 @@
         200
       ],
       "ee_y_up_gain": [
-        8000,
+        4500,
         6000,
         6000,
         6000,
@@ -3069,9 +3069,9 @@
   },
   "metadata": {
     "architecture": "hailo15h",
-    "content_hash": "916baee7e323ffc691b9f532367d06e3a96911211889981e5dffa16f3646b9c3",
+    "content_hash": "2327c1baa4bccb02ad4758b55f30ef197efa086b893b0f9b6e649a384a7a6cab",
     "description": "",
-    "generation_timestamp": "2026-10-16T04:12:27.075251+00:00"
+    "generation_timestamp": "2026-10-21T05:27:05.986514+00:00"
   },
   "version": "1.4.0"
 }
