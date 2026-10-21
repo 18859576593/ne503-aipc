@@ -483,6 +483,51 @@ bool encoder_input_layout_changed(const config_profile_t &previous_profile,
     return false;
 }
 
+/**
+ * Encoder changes set_override_parameters' in-place path cannot express: it
+ * reports success while the rebuilt encoder keeps the old value.
+ *
+ * Measured on medialib 1.13 (2026-10-13): a ReconfigureEncoder codec flip
+ * h265->h264 took the in-place path (full_reinit_required=0) and the stream
+ * stayed h265 until the next daemon restart — set_override_parameters does not
+ * apply an encoder codec change. Same for GOP on HEVC: the 1.13 HEVC encoder
+ * keys IDR cadence off gop_config.gop_size (an encoder-json field written at
+ * generate time, see apply_encoder_overrides), not rate_control.intra_pic_rate,
+ * so an in-place intra_pic_rate update never reaches a running h265 stream.
+ */
+bool encoder_inplace_ineffective_change(const config_profile_t &previous_profile,
+                                        const config_profile_t &new_profile)
+{
+    auto prev_map = previous_profile.to_encoder_config_map();
+    auto new_map = new_profile.to_encoder_config_map();
+    for (const auto &entry : new_map)
+    {
+        auto pit = prev_map.find(entry.first);
+        if (pit == prev_map.end())
+        {
+            continue;
+        }
+        const hailo_encoder_config_t *prev_h =
+            std::get_if<hailo_encoder_config_t>(&pit->second);
+        const hailo_encoder_config_t *new_h =
+            std::get_if<hailo_encoder_config_t>(&entry.second);
+        if (!prev_h || !new_h)
+        {
+            continue;
+        }
+        if (prev_h->output_stream.codec != new_h->output_stream.codec)
+        {
+            return true;
+        }
+        if (prev_h->output_stream.codec == CODEC_TYPE_HEVC &&
+            prev_h->rate_control.intra_pic_rate != new_h->rate_control.intra_pic_rate)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 int connect_encoders(Hailo15MediaPriv *p);
 int connect_frontend(Hailo15MediaPriv *p);
 void disconnect_ml_bridge_callbacks(Hailo15MediaPriv *p);
@@ -1607,6 +1652,27 @@ static void apply_encoder_overrides(std::string &config_json, const char *overri
                     uint32_t cur_ipr = he["rate_control"].value("intra_pic_rate", 0u);
                     if (cur_ipr != so.gop) gop_changed = true;
                 }
+                /* The 1.13 HEVC encoder keys IDR cadence off gop_config.gop_size,
+                 * not intra_pic_rate (measured: gop_size=2 + intra_pic_rate=60
+                 * produced an IDR every 2nd frame on h265 while h264 with the same
+                 * file was normal). Treat a gop_size mismatch on an HEVC stream as
+                 * a gop change too, or the IDR storm survives an intra-only match.
+                 * An out-of-range (>8) gop_size on an h264 stream (left behind by
+                 * an HEVC phase of this same file) must also trigger patching so
+                 * it gets normalized back into the valid Hantro range below. */
+                if (he.contains("gop_config")) {
+                    std::string cur_codec;
+                    if (he.contains("config") && he["config"].contains("output_stream"))
+                        cur_codec = he["config"]["output_stream"].value("codec", std::string());
+                    std::string exp_codec = codec_to_enum(so.codec);
+                    const std::string &eff_codec = !exp_codec.empty() ? exp_codec : cur_codec;
+                    uint32_t cur_gs = he["gop_config"].value("gop_size", 0u);
+                    if (eff_codec == "CODEC_TYPE_HEVC" && cur_gs != std::min(so.gop, 8u))
+                        gop_changed = true;
+                    else if (eff_codec != "CODEC_TYPE_HEVC" &&
+                             cur_gs != (so.gop <= 8u ? so.gop : 1u))
+                        gop_changed = true;
+                }
             }
 
             if (!dim_changed && !codec_changed && !bitrate_changed && !gop_changed) continue;
@@ -1631,6 +1697,30 @@ static void apply_encoder_overrides(std::string &config_json, const char *overri
                 }
                 if (gop_changed) {
                     he["rate_control"]["intra_pic_rate"] = so.gop;
+                    /* HEVC follows gop_size for IDR cadence — patch it alongside
+                     * intra_pic_rate. The 1.13 encoder rejects gop_size > 8
+                     * outright (init_gop_config failure → encoder cannot start,
+                     * stream death, measured with 16/30/60), so clamp to 8 and
+                     * keep long-GOP HEVC functional at the lib's max. h264
+                     * (Hantro) keeps gop_size as the B-frame structure (valid
+                     * 1-8) and must not take an IDR interval here; normalize an
+                     * out-of-range leftover from an HEVC phase of this file. */
+                    std::string eff_codec = he["config"]["output_stream"].value("codec", std::string());
+                    if (eff_codec == "CODEC_TYPE_HEVC") {
+                        if (so.gop > 8u)
+                            HAL_LOG_WARNING("hailo15_media: encoder override gop=%u exceeds HEVC gop_size limit 8, clamped", so.gop);
+                        he["gop_config"]["gop_size"] = std::min(so.gop, 8u);
+                    } else if (he.contains("gop_config")) {
+                        /* h264: gop_size is the output release granularity, not
+                         * the user GOP (that maps to intra_pic_rate). Template
+                         * leftover 2 releases 2 frames per tick (measured 66ms
+                         * inter-packet gaps); 1 restores per-frame release
+                         * (measured 33ms). An explicit small user gop (<=8)
+                         * keeps its value for I-frame-heavy modes. */
+                        uint32_t h264_gs = so.gop <= 8u ? so.gop : 1u;
+                        if (he["gop_config"].value("gop_size", 0u) != h264_gs)
+                            he["gop_config"]["gop_size"] = h264_gs;
+                    }
                 }
             }
 
@@ -1690,15 +1780,30 @@ static void apply_encoder_overrides(std::string &config_json, const char *overri
             /* Apply codec/bitrate/gop from YAML override */
             if (enc_root->contains("hailo_encoder")) {
                 auto &he = (*enc_root)["hailo_encoder"];
+                std::string eff_codec;
                 if (!so.codec.empty()) {
                     std::string codec_enum = codec_to_enum(so.codec);
                     if (!codec_enum.empty())
                         he["config"]["output_stream"]["codec"] = codec_enum;
+                    eff_codec = codec_enum;
                 }
                 if (so.bitrate > 0)
                     he["rate_control"]["bitrate"]["target_bitrate"] = so.bitrate;
-                if (so.gop > 0)
+                if (so.gop > 0) {
                     he["rate_control"]["intra_pic_rate"] = so.gop;
+                    /* HEVC keys IDR cadence off gop_config.gop_size (see Pass 1
+                     * note) — write it or an injected h265 stream inherits the
+                     * template's gop_size and runs an IDR storm. h264 keeps
+                     * gop_size as the 1-8 B-frame structure: HEVC-only write,
+                     * plus normalize any out-of-range template leftover. */
+                    if (eff_codec.empty() && he.contains("config") &&
+                        he["config"].contains("output_stream"))
+                        eff_codec = he["config"]["output_stream"].value("codec", std::string());
+                    if (eff_codec == "CODEC_TYPE_HEVC")
+                        he["gop_config"]["gop_size"] = std::min(so.gop, 8u); /* >8 rejected by lib (init fails) */
+                    else if (he.contains("gop_config"))
+                        he["gop_config"]["gop_size"] = so.gop <= 8u ? so.gop : 1u; /* release granularity: 1 = per-frame */
+                }
             }
 
             if (new_enc.contains("metadata") && new_enc["metadata"].is_object())
@@ -2487,6 +2592,17 @@ static std::string patch_json_stream_layout(const std::string &stored_json,
                                             {
                                                 he["rate_control"]["intra_pic_rate"] =
                                                     enc.rate_control.intra_pic_rate;
+                                                /* HEVC keys IDR cadence off gop_config.gop_size
+                                                 * (see apply_encoder_overrides Pass 1 note) — a full
+                                                 * reinit rebuilds the encoder from this json, so an
+                                                 * HEVC stream must carry the gop there or it keeps
+                                                 * the template's gop_size. h264 keeps gop_size as
+                                                 * the 1-8 B-frame structure: HEVC-only write. */
+                                                if (enc.output_stream.codec == CODEC_TYPE_HEVC)
+                                                {
+                                                    he["gop_config"]["gop_size"] =
+                                                        std::min(enc.rate_control.intra_pic_rate, 8u); /* >8 rejected by lib */
+                                                }
                                             }
                                         }
 
@@ -5590,7 +5706,8 @@ static int hailo15_media_override_stream_params(void *media_ctx, const HalStream
     // set_override_parameters only does an in-place restart that leaves multi_resize timestamp
     // accumulators stale, causing buffer pool exhaustion.  Do a full ML destroy+recreate instead.
     const bool full_reinit_required =
-        ml_stream_restart_required(prev_p, p) || encoder_input_layout_changed(prev_p, p);
+        ml_stream_restart_required(prev_p, p) || encoder_input_layout_changed(prev_p, p) ||
+        encoder_inplace_ineffective_change(prev_p, p);
     HAL_LOG_INFO("hailo15_media: override_stream_params: full_reinit_required=%d, "
                  "prev_framerate=%u, new_framerate=%u",
                  full_reinit_required,
@@ -5908,8 +6025,15 @@ static std::string hailo15_generate_pipeline_config_json(
                         he["rate_control"]["bitrate"]["target_bitrate"] = sc.encoder_bitrate;
                     if (sc.encoder_gop > 0 && he.contains("rate_control"))
                         he["rate_control"]["intra_pic_rate"] = sc.encoder_gop;
-                    if (sc.encoder_gop > 0 && sc.encoder_gop <= 8 && he.contains("gop_config"))
-                        he["gop_config"]["gop_size"] = sc.encoder_gop;
+                    if (sc.encoder_gop > 0 && he.contains("gop_config"))
+                    {
+                        if (sc.encoder_gop <= 8)
+                            he["gop_config"]["gop_size"] = sc.encoder_gop;
+                        else if (codec_type == "CODEC_TYPE_HEVC")
+                            he["gop_config"]["gop_size"] = 8; /* >8 rejected by lib (init fails, encoder cannot start) */
+                        else
+                            he["gop_config"]["gop_size"] = 1; /* h264 release granularity: 1 = per-frame (2 batches 66ms ticks) */
+                    }
                 }
 
                 /* Write injected encoder file */
@@ -6061,10 +6185,26 @@ static std::string hailo15_generate_pipeline_config_json(
                             }
                             /* gop_config: only write gop_size when the value is a valid Hantro
                              * B-frame hierarchy (1-8). Larger values are I-frame intervals
-                             * already routed through intra_pic_rate above. */
-                            if (sc.encoder_gop > 0 && sc.encoder_gop <= 8 && he.contains("gop_config"))
+                             * already routed through intra_pic_rate above — EXCEPT on HEVC,
+                             * where 1.13 keys IDR cadence off gop_size (see
+                             * encoder_inplace_ineffective_change): an h265 stream must carry
+                             * its full IDR interval here or it falls back to the file's
+                             * previous gop_size (measured IDR-every-2-frames storm). On h264,
+                             * normalize an out-of-range leftover from an HEVC phase. */
+                            if (sc.encoder_gop > 0 && he.contains("gop_config"))
                             {
-                                he["gop_config"]["gop_size"] = sc.encoder_gop;
+                                if (sc.encoder_gop <= 8)
+                                {
+                                    he["gop_config"]["gop_size"] = sc.encoder_gop;
+                                }
+                                else if (codec_type == "CODEC_TYPE_HEVC")
+                                {
+                                    he["gop_config"]["gop_size"] = 8; /* >8 rejected by lib (init fails, encoder cannot start) */
+                                }
+                                else
+                                {
+                                    he["gop_config"]["gop_size"] = 1; /* h264 release granularity: 1 = per-frame */
+                                }
                             }
                         }
 
