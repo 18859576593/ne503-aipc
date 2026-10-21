@@ -79,7 +79,7 @@ and service startup instructions.
 
 ### Hailo-15 release build
 
-The release container includes the Hailo/Poky SDK. With Git and Docker
+The release container includes a baked-in Hailo/Poky SDK. With Git and Docker
 installed, build a device package with:
 
 ```bash
@@ -92,6 +92,34 @@ make docker-pack-release VERSION=1.0.0
 The package is written to
 `build/release/neoruntime-hailo15-1.0.0.tar.gz`. MCU OTA firmware is rebuilt by
 default; pass `BUILD_MCU_FW=0` only when packaging existing MCU artifacts.
+
+To build against a host SDK instead of the baked-in one — required to match
+the official release configuration (Poky 4.0.23 toolchain with medialib
+1.13.0) — download the toolchain zip from the CamThink resource mirror and
+run the self-extracting installer it contains:
+
+```bash
+# ~2.8 GB zip containing the vendor toolchain installer
+curl -LO https://resources.camthink.ai/tools/poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15-ne503-toolchain-4.0.23.zip
+unzip poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15-ne503-toolchain-4.0.23.zip
+chmod +x poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15-ne503-toolchain-4.0.23.sh
+sudo ./poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15-ne503-toolchain-4.0.23.sh -y -d /opt/poky/4.0.23
+```
+
+`-y` accepts the toolchain license prompt and `-d` selects the install
+prefix; the installed tree must contain `environment-setup-armv8a-poky-linux`.
+Then point `docker-pack-release` at it — the SDK is bind-mounted read-only
+into the container over `/opt/hailo-sdk`:
+
+```bash
+make docker-pack-release \
+  DOCKER_RELEASE_SDK_HOST_DIR=/opt/poky/4.0.23 \
+  VERSION=1.0.0
+```
+
+Packages built with this SDK link medialib 1.13 and only load on device OS
+1.13.0 or newer; `AIPC_MIN_OS_VERSION`/`AIPC_MAX_OS_VERSION` default to that
+floor.
 
 To use the same container as an interactive build environment — shell
 access to the Hailo/Poky SDK for running individual make targets:
@@ -109,6 +137,9 @@ Inside the container:
 git config --global --add safe.directory /ne503
 make pack-release VERSION=0.1.0
 ```
+
+To use a host-installed SDK interactively, add the same read-only mount:
+`-v /opt/poky/4.0.23:/opt/hailo-sdk:ro`.
 
 For local cross-compilation with a vendor SDK, see the
 [build guide](docs/getting-started/BUILD.md).
