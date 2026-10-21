@@ -3059,7 +3059,7 @@
   "dewarp": {
     "camera_type": "CAMERA_TYPE_PINHOLE",
     "color_interpolation": "INTERPOLATION_TYPE_BILINEAR",
-    "enabled": true,
+    "enabled": false,
     "sensor_calib_path": "/etc/imaging/cfg/hailo15h/imx678/theia_sl410m/4k/shared/calibration/cam_intrinsics.txt"
   },
   "grayscale": false,
@@ -3069,7 +3069,7 @@
   },
   "metadata": {
     "architecture": "hailo15h",
-    "content_hash": "2327c1baa4bccb02ad4758b55f30ef197efa086b893b0f9b6e649a384a7a6cab",
+    "content_hash": "58cbd89d98e2894fa26ce15aa86ac3e1e56c222c29b2cf297ee03c37e1bc80b1",
     "description": "",
     "generation_timestamp": "2026-10-21T05:27:05.986514+00:00"
   },

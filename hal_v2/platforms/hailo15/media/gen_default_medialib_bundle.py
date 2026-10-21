@@ -49,6 +49,14 @@ DEFAULT_STREAMS = [
 DEFAULT_FRAMERATE = 30
 DEFAULT_POOL_MAX_BUFFERS = 20
 
+# Profiles whose iq_settings carries its own dewarp decision. Everything else has
+# dewarp forced on (see normalize_profile); the AF-lens daylight entry is tuned
+# without the correction pass, so the flag from its json is preserved. Matched as
+# a path suffix — profile_path is the container's absolute /etc/imaging/... ref.
+DEWARP_OPT_OUT_PROFILE_SUFFIXES = (
+    "profiles/daylight/webserver_daylight/webserver_daylight_basic_profile.json",
+)
+
 
 # ---- content_hash: faithful port of medialib ConfigValidator::calculate_json_hash ----
 # sha256 over the canonical incremental serialization (sorted object keys; floats as
@@ -278,9 +286,14 @@ def normalize_profile(files, profile_path):
 
     # Force lens dewarp (anti-distortion) on by default in every mode (daylight/HDR/
     # AI_ISP/IR): the camera ships with a fixed lens, so correction is always wanted.
+    # Exception: the AF-lens daylight profile is retuned with dewarp off (the bench
+    # tuning for that lens was done without the correction pass), so its own value
+    # is honoured instead of being overridden.
     iq_ref = profile.get("iq_settings")
     if isinstance(iq_ref, str) and iq_ref in files:
-        files[iq_ref].setdefault("dewarp", {})["enabled"] = True
+        dewarp = files[iq_ref].setdefault("dewarp", {})
+        if not profile_path.endswith(DEWARP_OPT_OUT_PROFILE_SUFFIXES):
+            dewarp["enabled"] = True
 
     # encoded_output_streams
     eos = profile.get("encoded_output_streams")
