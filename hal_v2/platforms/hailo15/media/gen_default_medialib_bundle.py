@@ -42,9 +42,9 @@ import sys
 # pool_max_buffers is DEFAULT_POOL_MAX_BUFFERS for every stream. target_bitrate scales
 # roughly with pixel count so each stream gets a sensible H264 default.
 DEFAULT_STREAMS = [
-    ("sink0", 1920, 1080, 6_000_000),  # 1080P ~6 Mbps
-    ("sink1", 1280, 720,  3_000_000),  # 720P   ~3 Mbps
-    ("sink2", 640, 384,   1_000_000),  # low    ~1 Mbps
+    ("sink0", 3840, 2160, 16_000_000),  # 4K ~16 Mbps (native-resolution main)
+    ("sink1", 1280, 720,   3_000_000),  # 720P   ~3 Mbps
+    ("sink2", 640, 384,    1_000_000),  # low    ~1 Mbps
 ]
 DEFAULT_FRAMERATE = 30
 DEFAULT_POOL_MAX_BUFFERS = 20
