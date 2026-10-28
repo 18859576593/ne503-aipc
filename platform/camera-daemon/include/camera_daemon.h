@@ -578,9 +578,11 @@ public:
     // a replayed request fires every branch of update_isp_settings.
     void build_isp_request_from_cache(aipc::camera::ISPUpdateRequest* req) const;
     // persist_isp_config: no-arg (reads cached_isp_state_), atomic tmp+rename,
-    // best-effort. Guarded at the call site with #ifdef HAS_GRPC (update_isp_settings
-    // is compiled unconditionally but the helper lives under HAS_GRPC).
-    void persist_isp_config();
+    // best-effort for the RPC result but reports success: on failure the caller
+    // sets isp_persist_dirty_ so no-op updates retry the stale mirror. Guarded
+    // at the call site with #ifdef HAS_GRPC (update_isp_settings is compiled
+    // unconditionally but the helper lives under HAS_GRPC).
+    bool persist_isp_config();
     // load_isp_config: read the snapshot at startup; returns false on missing
     // (INFO) or unparseable (WARNING + Clear) — never aborts init.
     bool load_isp_config(aipc::camera::ISPUpdateRequest* req);
@@ -930,6 +932,17 @@ private:
     HalIspImageConfig cached_isp_state_;
     bool isp_state_initialized_ = false;
     void init_isp_cache();  // Initialize cache from HAL or defaults
+    // True while cached_isp_state_ holds fallback defaults rather than values
+    // read from the hardware: equality against it proves nothing, so the
+    // same-value dedup stays bypassed until a real HAL write turns it false.
+    bool isp_cache_synthetic_ = false;
+    // Set when persist_isp_config() failed; a later no-op update retries the
+    // stale mirror instead of returning early and leaving it behind forever.
+    bool isp_persist_dirty_ = false;
+    // Serializes update_isp_settings (gRPC sync handlers run on the default
+    // thread pool, so concurrent ISP PUTs race the dedup compare against the
+    // in-flight cache write).
+    std::mutex isp_update_mu_;
 
     // Transform/image config cache. Runtime overrides (rotation/flip/dewarp/grayscale)
     // applied via dynamic_change_image_config() live only in the media context and are
