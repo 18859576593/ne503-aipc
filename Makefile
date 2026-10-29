@@ -42,7 +42,7 @@ endif
 DOCKER_RELEASE_NODE_VERSION ?= 24.18.0
 DOCKER_RELEASE_PNPM_VERSION ?= 10.34.5
 DOCKER_PULL ?= 1
-AIPC_OS_VERSION ?= 1.12.0
+AIPC_OS_VERSION ?= 1.13.0
 AIPC_MIN_OS_VERSION ?= $(AIPC_OS_VERSION)
 AIPC_MAX_OS_VERSION ?= $(AIPC_OS_VERSION)
 # Backward-compatible single-schema default. Release callers that support a

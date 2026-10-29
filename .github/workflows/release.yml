@@ -93,10 +93,12 @@ jobs:
           echo "FIRMWARE_VERSION=v${RAW}" >> "$GITHUB_ENV"
 
       - name: Upload firmware package
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: neoruntime-hailo-firmware-${{ env.FIRMWARE_VERSION }}
           path: build/release/neoruntime-hailo15-*.tar.gz
+          retention-days: 7
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
@@ -157,10 +159,12 @@ jobs:
           cat ct-disc-sha256sums.txt
 
       - name: Upload ct-disc tools artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: ct-disc-tools
           if-no-files-found: error
+          retention-days: 7
           path: |
             tools/ct-disc/dist/ct-disc-*
             tools/ct-disc/ct-disc-gui-windows-amd64-v*.zip
