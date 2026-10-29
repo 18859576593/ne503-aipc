@@ -178,10 +178,10 @@ ai_overlay:
 encoders:
   - stream_name: main
     codec: h264
-    width: 1920
-    height: 1080
+    width: 3840
+    height: 2160
     fps: 30
-    bitrate: 4000000
+    bitrate: 16000000
     gop: 30
     enabled: true
   - stream_name: sub

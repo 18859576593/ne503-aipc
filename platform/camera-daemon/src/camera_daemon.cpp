@@ -656,6 +656,26 @@ bool CameraDaemon::init(const DaemonConfig& config) {
     return true;
 }
 
+// Map a persisted (or synthesized) profile name from the shared pre-per-lens
+// entry names to this lens's effective entry — the pure-name twin of the
+// substitution inside the boot replay block in run(). The race guard must
+// compare like with like: the on-disk snapshot keeps the generic name until
+// something re-persists it, which without this normalization would always
+// look like a concurrent change on an upgraded per-lens unit and silently
+// skip the replay (the unit would boot on the wrong lens's IQ tuning).
+static std::string normalize_persisted_profile_for_lens(
+    std::string name, const DaemonConfig& config) {
+    if (name == "Infrared_Basic" &&
+        config.infrared.infrared_profile == "Infrared_Basic_FG2009") {
+        return config.infrared.infrared_profile;
+    }
+    if (name == "Daylight_Basic" &&
+        config.media_daylight_profile != "Daylight_Basic") {
+        return config.media_daylight_profile;
+    }
+    return name;
+}
+
 void CameraDaemon::run() {
     // Set running first, then honor the latched stop request. This ordering
     // closes both races:
@@ -809,7 +829,7 @@ void CameraDaemon::run() {
                 // moved during the gate.
                 std::string persisted_now;
                 if (load_profile_config(&persisted_now) &&
-                    persisted_now != persisted_profile) {
+                    normalize_persisted_profile_for_lens(persisted_now, config_) != persisted_profile) {
                     HAL_LOG_INFO("CameraDaemon: persisted profile changed during the boot "
                                  "replay gate ('%s' -> '%s'); leaving it in place",
                                  persisted_profile.c_str(),
