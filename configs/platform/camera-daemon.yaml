@@ -125,6 +125,22 @@ autofocus:
   balanced_retry: 1
   confidence_accept: 0.80
   confidence_recovery: 0.65
+  # Profiles whose AF statistic is computed on the output of a temporally
+  # recurrent network (AI ISP pre-ISP denoise): after a lens jump the
+  # statistic at a fixed position keeps changing for several frames. While one
+  # of these is active the temporal_* overrides below apply to the scan; 0
+  # keeps the built-in sampling and acceptance gates.
+  temporal_statistic_profiles: "AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic"
+  temporal_post_move_settle_frames: 0
+  temporal_probe_metric_frames: 0
+  temporal_verify_metric_frames: 0
+  temporal_peak_verify_min_frac: 0
+  temporal_peak_noise_floor: 0
+  temporal_peak_min_prominence: 0
+  # Diagnostic: with trace_scan on, read this many frames after the move to
+  # each verification candidate and log the per-frame statistic (the settling
+  # curve). 0 off.
+  trace_settle_frames: 0
 
 infrared:
   enabled: true

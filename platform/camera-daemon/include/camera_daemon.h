@@ -658,6 +658,10 @@ public:
     bool start_autofocus_zoom_follow(float ratio, uint64_t* job_id, std::string* error);
     bool cancel_autofocus(uint64_t job_id, std::string* error);
     void invalidate_autofocus_anchor(const std::string& reason);
+    // Re-declares to the AF controller whether the profile the media pipeline
+    // reports as current produces its statistic behind a temporally-recurrent
+    // stage. Call after construction and after every profile change.
+    void sync_autofocus_statistic_profile();
     AutofocusStatus get_autofocus_status() const;
 
     // LED control (white light, IR LED)

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "af_temporal_profile.h"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -113,6 +115,33 @@ struct AutofocusConfig {
     double confidence_accept = 0.80;
     double confidence_recovery = 0.65;
 
+    // Profiles whose AF statistic is produced behind a temporally-recurrent
+    // stage. With AI ISP pre-ISP denoise the network output IS the ISP input
+    // the AF statistics are computed on, and each output frame still depends
+    // on the previous frame's state — so for a few frames after a lens jump
+    // the statistic at a fixed position is a blend of the old and new image.
+    // Comma-separated exact profile names; empty disables the overrides.
+    std::string temporal_statistic_profiles =
+        "AI_ISP_Gen2_Basic,AI_ISP_Gen3_Basic";
+    // Scan sampling/acceptance overrides, applied only while such a profile
+    // is active. Each <= 0 keeps the built-in scan behavior.
+    // Extra frames to wait after the lens stops before every statistic read.
+    int temporal_post_move_settle_frames = 0;
+    // Frames per scan probe (median), replacing the fixed 1 (fast) / 3
+    // (balanced) probe reads.
+    int temporal_probe_metric_frames = 0;
+    int temporal_verify_metric_frames = 0;
+    // Peak verification: a curve maximum picked out of a noisy statistic is
+    // biased high, so the re-measured value falls further below it than the
+    // built-in 0.55 gate allows.
+    double temporal_peak_verify_min_frac = 0.0;
+    double temporal_peak_noise_floor = 0.0;
+    double temporal_peak_min_prominence = 0.0;
+    // Diagnostic (needs trace_scan): read this many consecutive frames after
+    // the move to each verification candidate and log the per-frame statistic
+    // relative to the last one — the settling curve of the statistic.
+    int trace_settle_frames = 0;
+
     // Sensor native resolution.  Set to non-zero to force AF windows to use
     // full sensor coordinates regardless of encoder output resolution changes.
     // When 0, the resolution is read from the initial video context at startup
@@ -174,6 +203,11 @@ public:
     bool cancel(uint64_t job_id, std::string* error);
     void invalidate_anchor(const std::string& reason);
     void update_video_context(void* video_ctx);
+    // Declares whether the active imaging profile produces the AF statistic
+    // behind a temporally-recurrent stage (see AutofocusConfig::
+    // temporal_statistic_profiles); the temporal_* scan overrides apply only
+    // while this is set. Re-sync after every profile change.
+    void set_temporal_statistic_profile(bool enabled);
     AutofocusStatus status() const;
 
 private:

@@ -964,6 +964,22 @@ static DaemonConfig load_config(const std::string& path) {
                 cfg.autofocus.sensor_native_width = static_cast<int>(parse_u32_config(val, "autofocus.sensor_native_width"));
             else if (trimmed.find("sensor_native_height:") != std::string::npos)
                 cfg.autofocus.sensor_native_height = static_cast<int>(parse_u32_config(val, "autofocus.sensor_native_height"));
+            else if (trimmed.find("temporal_statistic_profiles:") != std::string::npos)
+                cfg.autofocus.temporal_statistic_profiles = val;
+            else if (trimmed.find("temporal_post_move_settle_frames:") != std::string::npos)
+                cfg.autofocus.temporal_post_move_settle_frames = static_cast<int>(parse_u32_config(val, "autofocus.temporal_post_move_settle_frames"));
+            else if (trimmed.find("temporal_probe_metric_frames:") != std::string::npos)
+                cfg.autofocus.temporal_probe_metric_frames = static_cast<int>(parse_u32_config(val, "autofocus.temporal_probe_metric_frames"));
+            else if (trimmed.find("temporal_verify_metric_frames:") != std::string::npos)
+                cfg.autofocus.temporal_verify_metric_frames = static_cast<int>(parse_u32_config(val, "autofocus.temporal_verify_metric_frames"));
+            else if (trimmed.find("temporal_peak_verify_min_frac:") != std::string::npos)
+                cfg.autofocus.temporal_peak_verify_min_frac = parse_float_config(val, "autofocus.temporal_peak_verify_min_frac");
+            else if (trimmed.find("temporal_peak_noise_floor:") != std::string::npos)
+                cfg.autofocus.temporal_peak_noise_floor = parse_float_config(val, "autofocus.temporal_peak_noise_floor");
+            else if (trimmed.find("temporal_peak_min_prominence:") != std::string::npos)
+                cfg.autofocus.temporal_peak_min_prominence = parse_float_config(val, "autofocus.temporal_peak_min_prominence");
+            else if (trimmed.find("trace_settle_frames:") != std::string::npos)
+                cfg.autofocus.trace_settle_frames = static_cast<int>(parse_u32_config(val, "autofocus.trace_settle_frames"));
         } else if (section == "infrared") {
             if (trimmed.find("enabled:") != std::string::npos)
                 cfg.infrared.enabled = (val == "true" || val == "1");

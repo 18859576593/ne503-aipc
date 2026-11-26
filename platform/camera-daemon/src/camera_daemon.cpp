@@ -4919,6 +4919,9 @@ void CameraDaemon::start_grpc_server() {
     }
 
     if (autofocus_controller_) {
+        // Before start(): start() queues the boot autofocus job, whose scan
+        // must already see the statistic source of the boot profile.
+        sync_autofocus_statistic_profile();
         autofocus_controller_->start();
         const bool restore_instead =
             config_.lens_model == "fg2009" && lens_archive.valid();
@@ -6450,6 +6453,17 @@ void CameraDaemon::invalidate_autofocus_anchor(const std::string& reason) {
     if (autofocus_controller_) autofocus_controller_->invalidate_anchor(reason);
 #else
     (void)reason;
+#endif
+}
+
+void CameraDaemon::sync_autofocus_statistic_profile() {
+#ifdef HAS_GRPC
+    if (!autofocus_controller_) return;
+    // Read back from the pipeline rather than trust the requested name: a
+    // switch that failed or rolled back leaves a different profile live.
+    autofocus_controller_->set_temporal_statistic_profile(
+        autofocus_profile_has_temporal_statistic(
+            config_.autofocus.temporal_statistic_profiles, get_current_profile()));
 #endif
 }
 
@@ -8984,6 +8998,13 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
     // force_recycle=false: normal switch — let same-layout take the fast path; the frame verify below
     // catches the 0-frame case and the rollback there uses force_recycle=true.
     // (rebuild gate raised + drained above, before the consumer stops)
+    // Whichever way the switch below goes — forward, failed, or rolled back
+    // by the frame verify — the AF statistic source must match the profile
+    // left live; the success path also syncs explicitly before AF restarts.
+    struct StatisticProfileSync {
+        CameraDaemon* self;
+        ~StatisticProfileSync() { self->sync_autofocus_statistic_profile(); }
+    } statistic_profile_sync{this};
     int ret = media_ops->switch_profile(media_ctx_, profile_name.c_str(), false);
     if (ret < 0) {
         HAL_LOG_ERROR("CameraDaemon: switch_profile to '%s' failed: %d, rolling back to '%s'",
@@ -9314,6 +9335,8 @@ bool CameraDaemon::switch_profile_internal(const std::string& profile_name,
 #ifdef HAS_GRPC
     if (restart_af && autofocus_controller_) {
         autofocus_controller_->update_video_context(video_source_->video_ctx());
+        // start() queues a boot autofocus job on the new profile.
+        sync_autofocus_statistic_profile();
         autofocus_controller_->start();
     }
 #endif

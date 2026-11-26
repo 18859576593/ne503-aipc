@@ -289,6 +289,14 @@ if(CAMERA_DAEMON_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(daynight-policy-test PRIVATE pthread)
     add_test(NAME daynight-policy-test COMMAND daynight-policy-test)
 
+    add_executable(af-temporal-profile-test
+        tests/af_temporal_profile_test.cpp
+    )
+    target_include_directories(af-temporal-profile-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    add_test(NAME af-temporal-profile-test COMMAND af-temporal-profile-test)
+
     add_executable(frame-watchdog-in-use-test
         tests/frame_watchdog_in_use_test.cpp
         src/frame_watchdog.cpp

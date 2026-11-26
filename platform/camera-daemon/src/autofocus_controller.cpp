@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -34,6 +35,12 @@ extern "C" {
 namespace {
 
 constexpr uint8_t kMotorStopped = 1;
+
+// Caps for the yaml-tunable temporal-statistic scan overrides, so a typo
+// cannot park a scan for minutes or read an unbounded frame burst.
+constexpr int kMaxPostMoveSettleFrames = 60;
+constexpr int kMaxMetricFrames = 15;
+constexpr int kMaxSettleTraceFrames = 120;
 
 uint64_t steady_now_ms() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -286,6 +293,17 @@ public:
         invalidate_anchor("video context changed");
     }
 
+    // Called from daemon/RPC threads while a scan may be running; the flag is
+    // atomic and each read simply picks up the override set in force there.
+    void set_temporal_statistic_profile(bool enabled) {
+        if (temporal_statistic_.exchange(enabled, std::memory_order_relaxed) == enabled) {
+            return;
+        }
+        HAL_LOG_INFO("Autofocus: statistic source %s temporally recurrent; "
+                     "temporal scan overrides %s",
+                     enabled ? "is" : "is not", enabled ? "active" : "inactive");
+    }
+
 private:
     HalIspOps* isp_ops_ = nullptr;
     HalVideoOps* video_ops_ = nullptr;
@@ -299,6 +317,11 @@ private:
     hal_auto_af::MetricConfig metric_config_{};
     hal_auto_af::FollowConfig follow_config_{};
     hal_auto_af::CalibrationProfile calibration_{};
+    // Declared by the daemon after every profile change; the scan overrides
+    // below read it on the worker thread.
+    std::atomic<bool> temporal_statistic_{false};
+    // Last focus position this controller commanded (worker thread only).
+    int32_t last_commanded_focus_ = INT32_MIN;
 
     // Sensor native resolution captured at construction time.
     // AF windows use these coordinates so focus quality is independent
@@ -513,12 +536,119 @@ private:
                         "attempts; scanning anyway", attempts);
     }
 
+    /* Temporal-statistic scan overrides. Active only while the current
+     * imaging profile has been declared as producing the AF statistic behind
+     * a temporally-recurrent stage, and only where the override is > 0; every
+     * other profile keeps the built-in scan unchanged. */
+    bool temporal_statistic() const {
+        return temporal_statistic_.load(std::memory_order_relaxed);
+    }
+
+    int post_move_settle_frames() const {
+        return temporal_statistic()
+            ? std::clamp(config_.temporal_post_move_settle_frames, 0,
+                         kMaxPostMoveSettleFrames)
+            : 0;
+    }
+
+    int probe_metric_frames(bool balanced) const {
+        int frames = balanced ? 3 : 1;
+        if (temporal_statistic() && config_.temporal_probe_metric_frames > 0) {
+            frames = std::clamp(config_.temporal_probe_metric_frames, 1,
+                                kMaxMetricFrames);
+        }
+        return frames;
+    }
+
+    int verification_metric_frames() const {
+        if (temporal_statistic() && config_.temporal_verify_metric_frames > 0) {
+            return std::clamp(config_.temporal_verify_metric_frames, 1,
+                              kMaxMetricFrames);
+        }
+        return defaults_.verification_metric_frames;
+    }
+
+    double peak_verify_min_frac() const {
+        return temporal_statistic() && config_.temporal_peak_verify_min_frac > 0.0
+            ? config_.temporal_peak_verify_min_frac
+            : defaults_.peak_verify_min_frac;
+    }
+
+    double peak_noise_floor(bool balanced) const {
+        if (temporal_statistic() && config_.temporal_peak_noise_floor > 0.0) {
+            return config_.temporal_peak_noise_floor;
+        }
+        return balanced ? defaults_.peak_noise_floor : defaults_.peak_fast_noise_floor;
+    }
+
+    double peak_min_prominence() const {
+        return temporal_statistic() && config_.temporal_peak_min_prominence > 0.0
+            ? config_.temporal_peak_min_prominence
+            : defaults_.peak_min_prominence;
+    }
+
+    /* Diagnostic settling curve: one statistic read per frame right after a
+     * lens move, each logged relative to the last frame of the series. */
+    int trace_settle_after_move(int position, int32_t jump) {
+        const int frames =
+            std::clamp(config_.trace_settle_frames, 0, kMaxSettleTraceFrames);
+        if (!config_.trace_scan || !temporal_statistic() || frames <= 0) {
+            return HAL_OK;
+        }
+        std::vector<double> metrics;
+        std::vector<double> lumas;
+        metrics.reserve(static_cast<size_t>(frames));
+        lumas.reserve(static_cast<size_t>(frames));
+        for (int i = 0; i < frames; ++i) {
+            if (cancelled()) return HAL_ERR_INVALID_STATE;
+            hal_auto_af::MetricObservation observation{};
+            const int ret = read_observation(1, 1, &observation);
+            if (ret != HAL_OK) return ret;
+            metrics.push_back(observation.metric);
+            lumas.push_back(observation.mean_luma);
+        }
+        const auto series = [](const std::vector<double>& values) {
+            const double last = values.back();
+            std::string out;
+            for (const double value : values) {
+                char cell[16];
+                std::snprintf(cell, sizeof(cell), " %.3f",
+                              last > 1e-12 ? value / last : 0.0);
+                out += cell;
+            }
+            return out;
+        };
+        HAL_LOG_INFO("Autofocus trace: settle pos=%d jump=%d frames=%d "
+                     "fv_rel=[%s ] luma_rel=[%s ] fv_last=%.4f",
+                     position, static_cast<int>(jump), frames,
+                     series(metrics).c_str(), series(lumas).c_str(),
+                     metrics.back());
+        return HAL_OK;
+    }
+
     int measure_focus(int position, int metric_frames,
                       hal_auto_af::FocusSample* sample,
-                      const hal_auto_af::TextureModel* texture = nullptr) {
+                      const hal_auto_af::TextureModel* texture = nullptr,
+                      bool trace_settle = false) {
         if (cancelled()) return HAL_ERR_INVALID_STATE;
         const int ret = lens_->focus_abs_wait(config_.pps, position, config_.move_timeout_ms);
         if (ret != HAL_OK) return ret;
+        const int32_t jump = last_commanded_focus_ == INT32_MIN
+            ? 0
+            : static_cast<int32_t>(position - last_commanded_focus_);
+        last_commanded_focus_ = position;
+        if (trace_settle) {
+            const int trace_ret = trace_settle_after_move(position, jump);
+            if (trace_ret != HAL_OK) return trace_ret;
+        }
+        const int settle = post_move_settle_frames();
+        for (int i = 0; i < settle; ++i) {
+            // One frame per wait: the frame-wait timeout covers the whole
+            // requested count, so a multi-frame wait would time out.
+            if (cancelled()) return HAL_ERR_INVALID_STATE;
+            const int settle_ret = wait_frames(1);
+            if (settle_ret != HAL_OK) return settle_ret;
+        }
         hal_auto_af::MetricObservation observation{};
         const int read_ret = read_observation(1, metric_frames, &observation);
         if (read_ret != HAL_OK) return read_ret;
@@ -554,8 +684,19 @@ private:
             const int took_ms = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - probe_t0).count());
-            HAL_LOG_INFO("Autofocus trace: probe pos=%d frames=%d fv=%.4f took=%dms moves=%d%s",
-                         position, metric_frames, sample.m, took_ms, *moves,
+            // Frame-to-frame scatter of the probe statistic: 0 for a
+            // single-frame probe, meaningful only with metric_frames > 1.
+            double mad = 0.0;
+            int windows = 0;
+            for (uint32_t w = 0; w < HAL_ISP_AF_MAX_WINDOWS; ++w) {
+                if ((sample.observation.valid_mask & (1u << w)) == 0u) continue;
+                mad += sample.observation.relative_mad[w];
+                ++windows;
+            }
+            if (windows > 0) mad /= static_cast<double>(windows);
+            HAL_LOG_INFO("Autofocus trace: probe pos=%d frames=%d fv=%.4f mad=%.3f "
+                         "took=%dms moves=%d%s",
+                         position, metric_frames, sample.m, mad, took_ms, *moves,
                          ret == HAL_OK ? "" : " FAILED");
         }
         if (ret != HAL_OK) return ret;
@@ -623,7 +764,8 @@ private:
 
         set_state(AutofocusState::Coarse, endpoint ? 0.88 : 0.15,
                   balanced ? "balanced coarse scan" : "fast coarse scan");
-        int ret = scan_symmetric(center, coarse_lo, coarse_hi, config_.coarse_step, 1,
+        int ret = scan_symmetric(center, coarse_lo, coarse_hi, config_.coarse_step,
+                                 probe_metric_frames(false),
                                  &coarse_curve, &cache, &moves, &best_pos, &best_metric);
         if (ret != HAL_OK) {
             result.error = ret;
@@ -655,7 +797,7 @@ private:
         set_state(AutofocusState::Fine, endpoint ? 0.92 : 0.48,
                   balanced ? "balanced fine scan" : "fast fine scan");
         ret = scan_symmetric(fine_center, fine_lo, fine_hi, config_.fine_step,
-                             balanced ? 3 : 1, &fine_curve, &cache, &moves,
+                             probe_metric_frames(balanced), &fine_curve, &cache, &moves,
                              &fine_best, &fine_metric);
         if (ret != HAL_OK) {
             result.error = ret;
@@ -679,7 +821,7 @@ private:
             const int lo2 = std::max(min_pos, global_pos - fine_span);
             const int hi2 = std::min(max_pos, global_pos + fine_span);
             ret = scan_symmetric(global_pos, lo2, hi2, config_.fine_step,
-                                 balanced ? 3 : 1, &fine2, &cache, &moves,
+                                 probe_metric_frames(balanced), &fine2, &cache, &moves,
                                  &fine2_best, &fine2_metric);
             if (ret != HAL_OK) {
                 result.error = ret;
@@ -713,8 +855,8 @@ private:
         for (int i = 0; i < static_cast<int>(ranked.size()) &&
                         i < defaults_.peak_verify_max_tries; ++i) {
             hal_auto_af::FocusSample verified{};
-            ret = measure_focus(ranked[i].pos, defaults_.verification_metric_frames,
-                                &verified, &texture);
+            ret = measure_focus(ranked[i].pos, verification_metric_frames(),
+                                &verified, &texture, /*trace_settle=*/true);
             if (ret != HAL_OK) continue;
             if (verified.m > best_verified) {
                 best_verified = verified.m;
@@ -722,7 +864,7 @@ private:
                 best_verified_observation = verified.observation;
             }
             if (ranked[i].m <= 1e-12 ||
-                verified.m >= defaults_.peak_verify_min_frac * ranked[i].m) {
+                verified.m >= peak_verify_min_frac() * ranked[i].m) {
                 picked_pos = ranked[i].pos;
                 picked_curve_metric = ranked[i].m;
                 picked_metric = verified.m;
@@ -765,12 +907,11 @@ private:
             ? std::clamp(picked_metric / picked_curve_metric, 0.0, 1.5) : 1.0;
         result.prominence = hal_auto_af::peak_prominence(merged, picked_pos);
         const double prominence_score = std::clamp(
-            result.prominence / defaults_.peak_min_prominence, 0.0, 1.0);
+            result.prominence / peak_min_prominence(), 0.0, 1.0);
         result.best_on_edge = picked_pos <= coarse_lo + follow_config_.follow_edge_margin_steps ||
                               picked_pos >= coarse_hi - follow_config_.follow_edge_margin_steps;
         hal_auto_af::PeakClosureConfig closure_config{};
-        closure_config.noise_floor = balanced ? defaults_.peak_noise_floor
-                                              : defaults_.peak_fast_noise_floor;
+        closure_config.noise_floor = peak_noise_floor(balanced);
         closure_config.plateau_ratio = defaults_.peak_plateau_ratio;
         closure_config.focus_step = config_.fine_step;
         closure_config.open_boundary_margin = defaults_.peak_open_boundary_margin_steps;
@@ -885,6 +1026,7 @@ private:
             }
             if (ret != HAL_OK) return ret;
         }
+        last_commanded_focus_ = focus_target;
 
         LensControllerState after{};
         ret = lens_->state_get(&after);
@@ -1356,6 +1498,10 @@ void AutofocusController::invalidate_anchor(const std::string& reason) {
 
 void AutofocusController::update_video_context(void* video_ctx) {
     impl_->update_video_context(video_ctx);
+}
+
+void AutofocusController::set_temporal_statistic_profile(bool enabled) {
+    impl_->set_temporal_statistic_profile(enabled);
 }
 
 AutofocusStatus AutofocusController::status() const { return impl_->status(); }
